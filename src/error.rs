@@ -20,6 +20,9 @@ pub enum GovmemError {
     #[error("Page fault at 0x{0:x} (level: {1})")]
     PageFault(u64, &'static str),
 
+    #[error("Pagefile fault at 0x{0:x} (PTE: 0x{1:x})")]
+    PageFileFault(u64, u64),
+
     #[error("System process not found")]
     SystemProcessNotFound,
 

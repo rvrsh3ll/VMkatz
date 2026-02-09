@@ -128,7 +128,7 @@ fn process_hive_data(
 }
 
 /// Parse MBR/GPT and find all NTFS partitions, returning their byte offsets.
-fn find_ntfs_partitions<R: Read + Seek>(reader: &mut R) -> Result<Vec<u64>> {
+pub(crate) fn find_ntfs_partitions<R: Read + Seek>(reader: &mut R) -> Result<Vec<u64>> {
     use std::io::SeekFrom;
     reader.seek(SeekFrom::Start(0))?;
     let mut mbr = [0u8; 512];
@@ -281,7 +281,7 @@ fn read_hive_files<R: Read + Seek>(
 }
 
 /// Find a directory entry by name (case-insensitive).
-fn find_entry<'n, R: Read + Seek>(
+pub(crate) fn find_entry<'n, R: Read + Seek>(
     ntfs: &'n ntfs::Ntfs,
     dir: &ntfs::NtfsFile<'n>,
     reader: &mut R,
@@ -351,13 +351,13 @@ fn read_file_data<R: Read + Seek>(
 }
 
 /// Wraps a Read+Seek with a partition offset.
-struct PartitionReader<'a, R: Read + Seek> {
+pub(crate) struct PartitionReader<'a, R: Read + Seek> {
     inner: &'a mut R,
     offset: u64,
 }
 
 impl<'a, R: Read + Seek> PartitionReader<'a, R> {
-    fn new(inner: &'a mut R, offset: u64) -> Self {
+    pub(crate) fn new(inner: &'a mut R, offset: u64) -> Self {
         Self { inner, offset }
     }
 }

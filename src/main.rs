@@ -8,6 +8,7 @@ use clap::Parser;
 
 #[cfg(any(feature = "vmware", feature = "vbox"))]
 use vmkatz::lsass;
+use vmkatz::lsass::finder::PagefileRef;
 #[cfg(any(feature = "vmware", feature = "vbox"))]
 use vmkatz::lsass::types::Credential;
 #[cfg(any(feature = "vmware", feature = "vbox"))]
@@ -36,6 +37,7 @@ use vmkatz::windows::process;
     after_help = "EXAMPLES:\n  \
         vmkatz snapshot.vmsn                        Extract LSASS credentials\n  \
         vmkatz --format ntlm snapshot.vmsn          Output as NTLM hashes\n  \
+        vmkatz --disk disk.vmdk snapshot.vmsn       Resolve paged-out creds from disk\n  \
         vmkatz disk.vdi                             Extract SAM hashes + LSA secrets\n  \
         vmkatz /path/to/vm/directory/               Auto-discover and process all files\n  \
         vmkatz --list-processes snapshot.vmsn        List running processes only\n  \
@@ -54,6 +56,11 @@ struct Args {
     #[cfg(feature = "sam")]
     #[arg(long, default_value_t = false)]
     sam: bool,
+
+    /// Disk image for pagefile.sys resolution (resolves paged-out memory from disk)
+    #[cfg(feature = "sam")]
+    #[arg(long, value_name = "DISK_IMAGE")]
+    disk: Option<String>,
 
     /// Output format
     #[arg(long, default_value = "text", value_name = "FORMAT", value_parser = ["text", "csv", "ntlm"])]
@@ -101,7 +108,27 @@ fn main() -> anyhow::Result<()> {
     }
 
     // LSASS credential extraction mode
-    run_lsass(input_path, &args)
+    #[cfg(feature = "sam")]
+    {
+        let pagefile_reader = args.disk.as_ref().and_then(|d| {
+            match vmkatz::paging::pagefile::PagefileReader::open(Path::new(d)) {
+                Ok(pf) => {
+                    println!(
+                        "[+] Pagefile: {:.1} MB",
+                        pf.pagefile_size() as f64 / (1024.0 * 1024.0),
+                    );
+                    Some(pf)
+                }
+                Err(e) => {
+                    eprintln!("[!] Failed to open pagefile from {}: {}", d, e);
+                    None
+                }
+            }
+        });
+        return run_lsass(input_path, &args, pagefile_reader.as_ref());
+    }
+    #[cfg(not(feature = "sam"))]
+    run_lsass(input_path, &args, Default::default())
 }
 
 #[cfg(feature = "sam")]
@@ -191,11 +218,39 @@ fn run_directory(dir: &Path, args: &Args) -> anyhow::Result<()> {
         return Ok(());
     }
 
+    // Try to open pagefile.sys from the first available disk image
+    #[cfg(feature = "sam")]
+    let pagefile_reader = if !discovery.lsass_files.is_empty() {
+        discovery.disk_files.first().and_then(|d| {
+            match vmkatz::paging::pagefile::PagefileReader::open(d) {
+                Ok(pf) => {
+                    println!(
+                        "[+] Pagefile: {:.1} MB from {}",
+                        pf.pagefile_size() as f64 / (1024.0 * 1024.0),
+                        d.file_name().unwrap_or_default().to_string_lossy()
+                    );
+                    Some(pf)
+                }
+                Err(e) => {
+                    log::info!("No pagefile from disk: {}", e);
+                    None
+                }
+            }
+        })
+    } else {
+        None
+    };
+
+    #[cfg(feature = "sam")]
+    let pagefile: PagefileRef<'_> = pagefile_reader.as_ref();
+    #[cfg(not(feature = "sam"))]
+    let pagefile: PagefileRef<'_> = Default::default();
+
     #[cfg(any(feature = "vmware", feature = "vbox"))]
     for file in &discovery.lsass_files {
         let name = file.file_name().unwrap_or_default().to_string_lossy();
         println!("\n[*] LSASS: {}", name);
-        if let Err(e) = run_lsass(file, args) {
+        if let Err(e) = run_lsass(file, args, pagefile) {
             eprintln!("[!] {}: {}", name, e);
         }
     }
@@ -217,7 +272,7 @@ fn run_directory(dir: &Path, args: &Args) -> anyhow::Result<()> {
     Ok(())
 }
 
-fn run_lsass(input_path: &Path, args: &Args) -> anyhow::Result<()> {
+fn run_lsass(input_path: &Path, args: &Args, pagefile: PagefileRef<'_>) -> anyhow::Result<()> {
     let verbose = args.verbose || args.list_processes;
     let ext = input_path.extension().and_then(|e| e.to_str()).unwrap_or("");
 
@@ -238,10 +293,12 @@ fn run_lsass(input_path: &Path, args: &Args) -> anyhow::Result<()> {
                 },
                 args,
                 verbose,
+                pagefile,
             )
         }
         #[cfg(not(feature = "vbox"))]
         {
+            let _ = pagefile;
             anyhow::bail!("VirtualBox .sav support not enabled (compile with --features vbox)")
         }
     } else {
@@ -272,10 +329,12 @@ fn run_lsass(input_path: &Path, args: &Args) -> anyhow::Result<()> {
                 },
                 args,
                 verbose,
+                pagefile,
             )
         }
         #[cfg(not(feature = "vmware"))]
         {
+            let _ = pagefile;
             anyhow::bail!("VMware .vmem/.vmsn support not enabled (compile with --features vmware)")
         }
     }
@@ -286,6 +345,7 @@ fn run_with_layer<L: PhysicalMemory, F: FnOnce() -> anyhow::Result<L>>(
     make_layer: F,
     args: &Args,
     verbose: bool,
+    pagefile: PagefileRef<'_>,
 ) -> anyhow::Result<()> {
     let layer = make_layer()?;
 
@@ -325,8 +385,18 @@ fn run_with_layer<L: PhysicalMemory, F: FnOnce() -> anyhow::Result<L>>(
     }
 
     // Extract credentials
-    let credentials = lsass::finder::extract_all_credentials(&layer, lsass_proc, system.dtb)
-        .context("Credential extraction failed")?;
+    let credentials =
+        lsass::finder::extract_all_credentials(&layer, lsass_proc, system.dtb, pagefile)
+            .context("Credential extraction failed")?;
+
+    // Report pagefile resolution stats
+    #[cfg(feature = "sam")]
+    if let Some(pf) = pagefile {
+        let resolved = pf.pages_resolved();
+        if resolved > 0 {
+            println!("[+] Pagefile: {} pages resolved from disk", resolved);
+        }
+    }
 
     match args.format.as_str() {
         "csv" => print_csv(&credentials),

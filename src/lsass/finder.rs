@@ -18,14 +18,29 @@ pub struct LsassDlls {
     pub cloudap: Option<LoadedModule>,
 }
 
+/// Pagefile reference type: wraps Option<&PagefileReader> when sam feature is enabled,
+/// or () when not. Allows a unified function signature across feature configurations.
+#[cfg(feature = "sam")]
+pub type PagefileRef<'a> = Option<&'a crate::paging::pagefile::PagefileReader>;
+#[cfg(not(feature = "sam"))]
+pub type PagefileRef<'a> = ();
+
 /// Find LSASS and extract all credentials.
+/// When a pagefile reader is provided, paged-out memory is resolved from disk.
 pub fn extract_all_credentials<P: PhysicalMemory>(
     phys: &P,
     lsass: &Process,
     _kernel_dtb: u64,
+    pagefile: PagefileRef<'_>,
 ) -> Result<Vec<Credential>> {
-    // Create virtual memory reader for LSASS
-    let lsass_vmem = ProcessMemory::new(phys, lsass.dtb);
+    // Create virtual memory reader for LSASS (with optional pagefile resolution)
+    #[cfg(feature = "sam")]
+    let lsass_vmem = ProcessMemory::with_pagefile(phys, lsass.dtb, pagefile);
+    #[cfg(not(feature = "sam"))]
+    let lsass_vmem = {
+        let _ = pagefile;
+        ProcessMemory::new(phys, lsass.dtb)
+    };
 
     log::info!(
         "LSASS: PID={}, DTB=0x{:x}, PEB=0x{:x}",

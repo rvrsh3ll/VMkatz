@@ -58,6 +58,14 @@ impl<'a, P: PhysicalMemory> PageTableWalker<'a, P> {
             if pte.is_transition() {
                 return Ok(pte.frame_addr() | (vaddr & 0xFFF));
             }
+            // Check for pagefile PTE (non-zero, not transition, not prototype)
+            if pte.is_pagefile() {
+                log::trace!(
+                    "PageFileFault: VA=0x{:x} PTE=0x{:016x} pfn={} offset=0x{:x}",
+                    vaddr, pte.raw(), pte.pagefile_number(), pte.pagefile_offset()
+                );
+                return Err(GovmemError::PageFileFault(vaddr, pte.raw()));
+            }
             return Err(GovmemError::PageFault(vaddr, "PT"));
         }
 
@@ -143,10 +151,13 @@ impl<'a, P: PhysicalMemory> PageTableWalker<'a, P> {
 }
 
 /// Process virtual memory: combines a DTB (CR3) with physical memory for address translation.
+/// Optional pagefile reader resolves pages swapped to pagefile.sys on disk.
 pub struct ProcessMemory<'a, P: PhysicalMemory> {
     phys: &'a P,
     walker: PageTableWalker<'a, P>,
     dtb: u64,
+    #[cfg(feature = "sam")]
+    pagefile: Option<&'a crate::paging::pagefile::PagefileReader>,
 }
 
 impl<'a, P: PhysicalMemory> ProcessMemory<'a, P> {
@@ -155,6 +166,22 @@ impl<'a, P: PhysicalMemory> ProcessMemory<'a, P> {
             phys,
             walker: PageTableWalker::new(phys),
             dtb,
+            #[cfg(feature = "sam")]
+            pagefile: None,
+        }
+    }
+
+    #[cfg(feature = "sam")]
+    pub fn with_pagefile(
+        phys: &'a P,
+        dtb: u64,
+        pagefile: Option<&'a crate::paging::pagefile::PagefileReader>,
+    ) -> Self {
+        Self {
+            phys,
+            walker: PageTableWalker::new(phys),
+            dtb,
+            pagefile,
         }
     }
 
@@ -182,12 +209,25 @@ impl<'a, P: PhysicalMemory> VirtualMemory for ProcessMemory<'a, P> {
             match self.walker.translate(self.dtb, current_vaddr) {
                 Ok(phys_addr) => {
                     if self.phys.read_phys(phys_addr, &mut buf[offset..offset + chunk]).is_err() {
-                        // Physical read failed, zero-fill
+                        buf[offset..offset + chunk].fill(0);
+                    }
+                }
+                #[cfg(feature = "sam")]
+                Err(GovmemError::PageFileFault(_vaddr, raw_pte)) => {
+                    // Try to resolve from pagefile.sys on disk
+                    if let Some(pf) = self.pagefile {
+                        if let Some(page_data) = pf.resolve_pte(raw_pte) {
+                            let page_off = (current_vaddr & 0xFFF) as usize;
+                            buf[offset..offset + chunk]
+                                .copy_from_slice(&page_data[page_off..page_off + chunk]);
+                        } else {
+                            buf[offset..offset + chunk].fill(0);
+                        }
+                    } else {
                         buf[offset..offset + chunk].fill(0);
                     }
                 }
                 Err(_) => {
-                    // Page not present (paged out / demand paging), zero-fill
                     buf[offset..offset + chunk].fill(0);
                 }
             }

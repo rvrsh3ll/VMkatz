@@ -27,4 +27,24 @@ impl PageTableEntry {
     pub fn raw(&self) -> u64 {
         self.0
     }
+
+    /// Windows pagefile PTE: not present (bit 0=0), not transition (bit 10=0),
+    /// not prototype (bit 11=0), and non-zero (has pagefile info).
+    /// Bits 1-4 = pagefile number, bits 32-63 = page offset in pagefile.
+    pub fn is_pagefile(&self) -> bool {
+        self.0 != 0
+            && (self.0 & 1) == 0
+            && (self.0 & (1 << 10)) == 0
+            && (self.0 & (1 << 11)) == 0
+    }
+
+    /// Pagefile number from bits 1-4 (usually 0 for primary pagefile.sys).
+    pub fn pagefile_number(&self) -> u8 {
+        ((self.0 >> 1) & 0xF) as u8
+    }
+
+    /// Byte offset into pagefile from bits 32-63 (page index * 4096).
+    pub fn pagefile_offset(&self) -> u64 {
+        ((self.0 >> 32) & 0xFFFF_FFFF) * 4096
+    }
 }
