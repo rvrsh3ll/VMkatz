@@ -2,18 +2,16 @@
 //!
 //! Decrypts LSA secrets (DPAPI keys, machine account passwords, cached domain
 //! keys, service passwords) using the bootkey from the SYSTEM hive.
-//! Supports both modern (AES-256-CBC, revision >= 0x00010006) and legacy
+//! Supports both modern (AES-256-ECB, revision >= 0x00010006) and legacy
 //! (RC4, older revisions) encryption schemes.
 
 use aes::Aes256;
-use cbc::cipher::{BlockDecryptMut, KeyIvInit};
+use aes::cipher::{BlockDecrypt, KeyInit};
 use sha2::Digest;
 
 use crate::error::{GovmemError, Result};
 use super::hive::Hive;
 use super::hashes::{rc4, md5_hash, decode_utf16le};
-
-type Aes256CbcDec = cbc::Decryptor<Aes256>;
 
 /// A single LSA secret with its name, raw data, and parsed interpretation.
 #[derive(Debug)]
@@ -205,7 +203,11 @@ pub fn extract_lsa_secrets(security_data: &[u8], bootkey: &[u8; 16]) -> Result<V
     Ok(secrets)
 }
 
-/// Extract LSA key using modern (AES-256) scheme from PolEKList.
+/// Extract LSA key using modern (AES-256-ECB) scheme from PolEKList.
+///
+/// Decrypted blob = LSA_SECRET_BLOB: Length(4) + Random(12) + Secret(Length).
+/// Secret = inner LSA_SECRET: Version(4) + KeyID(16) + Algo(4) + Flags(4) + EncryptedData.
+/// LSA key = EncryptedData[:32] = blob[44..76] (per impacket: parse Secret as LSA_SECRET).
 fn extract_lsa_key_modern(
     hive: &Hive,
     policy: &super::hive::Key,
@@ -214,59 +216,57 @@ fn extract_lsa_key_modern(
     let ek_key = policy.subkey(hive, "PolEKList")?;
     let ek_data = ek_key.value(hive, "")?;
 
-    if ek_data.len() < 28 + 32 + 32 {
+    if ek_data.len() < 28 + 32 {
         return Err(lsa_err("PolEKList value too short"));
     }
 
-    // LSA_SECRET structure: 28-byte header, then 32-byte salt, then encrypted data
+    // NT6_HARD_SECRET: 28-byte header + 32-byte salt ("lazyiv") + ciphertext
     let salt = &ek_data[28..60];
     let encrypted = &ek_data[60..];
 
     let decrypted = decrypt_aes_sha256(bootkey, salt, encrypted)?;
 
-    // Decrypted blob is LSA_SECRET_BLOB: length(4) + unknown data + key
-    // The actual 32-byte LSA key starts at offset 68 in the decrypted blob
-    // Structure: length(4) + unk(12) + unk(16) + unk(4) + key_data(32) = at offset 36
-    // impacket uses: secretBlob.Secret where Secret starts after fixed header
-    if decrypted.len() < 68 + 32 {
-        // Alternative: try parsing the LSA_SECRET_BLOB with length field
-        // The blob format: u32 length at offset 0, then at offset 16 or 36 the key
-        let blob_len = if decrypted.len() >= 4 {
-            u32::from_le_bytes(decrypted[0..4].try_into().unwrap()) as usize
-        } else {
-            return Err(lsa_err("Decrypted PolEKList too short for LSA_SECRET_BLOB"));
-        };
+    // LSA_SECRET_BLOB: Length(4) + Random(12) + Secret(Length)
+    if decrypted.len() < 16 {
+        return Err(lsa_err("PolEKList decrypted blob too short"));
+    }
+    let blob_len = u32::from_le_bytes(decrypted[0..4].try_into().unwrap()) as usize;
+    log::debug!(
+        "PolEKList decrypted ({} bytes, blob_len={}): {}",
+        decrypted.len(),
+        blob_len,
+        hex::encode(&decrypted[..std::cmp::min(decrypted.len(), 160)])
+    );
 
-        // Try to find the 32-byte key in the blob
-        // Common layout: the key is the 'Secret' field, located after the BLOB header
-        // LSA_SECRET_BLOB: Length(4) + Unknown(12) + Secret(Length bytes)
-        if decrypted.len() >= 16 + 32 && blob_len >= 32 {
+    // Secret at offset 16 is NT6_SYSTEM_KEYS (per mimikatz):
+    //   unkType0(4) + CurrentKeyID(16) + unkType1(4) + nbKeys(4) = 28-byte header
+    //   NT6_SYSTEM_KEY[0]: KeyId(16) + KeyType(4) + KeySize(4) + Key(KeySize)
+    // LSA key = Key[0].Key = blob[16 + 28 + 16 + 4 + 4 .. +32] = blob[68..100]
+    let keys_header = 16 + 28; // NT6_SYSTEM_KEYS header ends at 44
+    let key_data_offset = keys_header + 16 + 4 + 4; // skip KeyId + KeyType + KeySize = 68
+    if decrypted.len() >= key_data_offset + 32 {
+        let key_size = u32::from_le_bytes(
+            decrypted[keys_header + 20..keys_header + 24].try_into().unwrap()
+        ) as usize;
+        if key_size == 32 && decrypted.len() >= key_data_offset + 32 {
             let mut key = [0u8; 32];
-            key.copy_from_slice(&decrypted[16..48]);
+            key.copy_from_slice(&decrypted[key_data_offset..key_data_offset + 32]);
             return Ok(key);
         }
-
-        return Err(lsa_err(&format!(
-            "PolEKList decrypted blob too short: {} bytes (blob_len={})",
-            decrypted.len(),
-            blob_len
-        )));
     }
 
-    // Standard path: skip 68 bytes of header/metadata, take 32 bytes of key
-    // Actually, impacket's LSA_SECRET_BLOB maps: Length(4) + randomdata(12) + Secret(variable)
-    // The Secret is at offset 16, with length from the Length field
-    let blob_len = u32::from_le_bytes(decrypted[0..4].try_into().unwrap()) as usize;
-    if blob_len >= 32 && decrypted.len() >= 16 + blob_len {
+    // Fallback: try impacket-style offset (Secret[28..60])
+    if decrypted.len() >= 16 + 28 + 32 {
         let mut key = [0u8; 32];
-        key.copy_from_slice(&decrypted[16..48]);
-        Ok(key)
-    } else {
-        // Fallback: key at offset 68
-        let mut key = [0u8; 32];
-        key.copy_from_slice(&decrypted[68..100]);
-        Ok(key)
+        key.copy_from_slice(&decrypted[44..76]);
+        return Ok(key);
     }
+
+    Err(lsa_err(&format!(
+        "PolEKList: blob_len={}, decrypted_len={}",
+        blob_len,
+        decrypted.len()
+    )))
 }
 
 /// Extract LSA key using legacy (RC4) scheme from PolSecretEncryptionKey.
@@ -306,9 +306,9 @@ fn extract_lsa_key_legacy(
     Ok(key)
 }
 
-/// Decrypt a secret value using modern (AES-256) scheme.
+/// Decrypt a secret value using modern (AES-256-ECB) scheme.
 fn decrypt_secret_modern(encrypted: &[u8], lsa_key: &[u8; 32]) -> Result<Vec<u8>> {
-    // Same LSA_SECRET structure: 28-byte header + 32-byte salt + encrypted data
+    // NT6_HARD_SECRET: 28-byte header + 32-byte salt + encrypted data (AES-256-ECB)
     if encrypted.len() < 28 + 32 {
         return Err(lsa_err("Secret value too short for modern decryption"));
     }
@@ -372,9 +372,10 @@ fn decrypt_secret_legacy(encrypted: &[u8], lsa_key: &[u8; 32]) -> Result<Vec<u8>
     }
 }
 
-/// SHA-256 + AES-256-CBC decryption (modern LSA scheme).
+/// SHA-256 + AES-256-ECB decryption (modern LSA scheme).
 /// Key derivation: SHA256(key_material + salt * 1000) → AES-256 key.
-/// IV: 16 zero bytes.
+/// Mode: ECB (per mimikatz CRYPT_MODE_ECB, impacket per-block CBC reinit, pypykatz ECB).
+/// The 32-byte "lazyiv" field is a KDF salt, NOT an AES IV.
 fn decrypt_aes_sha256(key_material: &[u8], salt: &[u8], encrypted: &[u8]) -> Result<Vec<u8>> {
     let mut hasher = sha2::Sha256::new();
     hasher.update(key_material);
@@ -383,26 +384,25 @@ fn decrypt_aes_sha256(key_material: &[u8], salt: &[u8], encrypted: &[u8]) -> Res
     }
     let derived_key: [u8; 32] = hasher.finalize().into();
 
-    let iv = [0u8; 16];
-    aes256_cbc_decrypt(&derived_key, &iv, encrypted)
+    aes256_ecb_decrypt(&derived_key, encrypted)
 }
 
-/// AES-256-CBC decryption (no padding).
-fn aes256_cbc_decrypt(key: &[u8; 32], iv: &[u8; 16], data: &[u8]) -> Result<Vec<u8>> {
+/// AES-256-ECB decryption (no IV, each block decrypted independently).
+fn aes256_ecb_decrypt(key: &[u8; 32], data: &[u8]) -> Result<Vec<u8>> {
     if data.is_empty() {
         return Ok(Vec::new());
     }
 
+    let cipher = Aes256::new(key.into());
     let mut buf = data.to_vec();
     // Pad to 16-byte boundary if needed
     let pad_len = (16 - (buf.len() % 16)) % 16;
     buf.extend(std::iter::repeat_n(0u8, pad_len));
 
-    let decryptor = Aes256CbcDec::new_from_slices(key, iv)
-        .map_err(|e| lsa_err(&format!("AES-256 init: {}", e)))?;
-    decryptor
-        .decrypt_padded_mut::<cbc::cipher::block_padding::NoPadding>(&mut buf)
-        .map_err(|e| lsa_err(&format!("AES-256 decrypt: {}", e)))?;
+    for chunk in buf.chunks_exact_mut(16) {
+        let block = aes::Block::from_mut_slice(chunk);
+        cipher.decrypt_block(block);
+    }
 
     buf.truncate(data.len());
     Ok(buf)
