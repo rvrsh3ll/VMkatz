@@ -643,18 +643,60 @@ pub fn try_mftmirr_fallback<R: Read + Seek>(
 
                         // Without parent check, validate data starts with "regf"
                         let rec_num = first_rec + rec_idx + i as u64;
-                        let is_hive = matches!(
-                            try_read_hive_start(reader, &record, &params, partition_offset),
-                            Some(true)
+                        let hive_check = try_read_hive_start(
+                            reader,
+                            &record,
+                            &params,
+                            partition_offset,
                         );
 
-                        if is_hive {
-                            log::info!(
-                                "MFTMirr scan: found {} at MFT record #{} (regf-validated)",
-                                name_upper,
-                                rec_num,
-                            );
-                            *target = Some(record);
+                        match hive_check {
+                            Some(true) => {
+                                log::info!(
+                                    "MFTMirr scan: found {} at MFT record #{} (regf-validated)",
+                                    name_upper,
+                                    rec_num,
+                                );
+                                *target = Some(record);
+                            }
+                            Some(false) => {
+                                log::info!(
+                                    "MFTMirr scan: found {} at MFT record #{} (not a regf hive, skipping)",
+                                    name_upper,
+                                    rec_num,
+                                );
+                            }
+                            None => {
+                                // First extent inaccessible — still try reading via
+                                // zero-fill. The regf header might be in a later run.
+                                log::info!(
+                                    "MFTMirr scan: found {} at MFT record #{} (first extent inaccessible, trying zero-fill read)",
+                                    name_upper,
+                                    rec_num,
+                                );
+                                if let Ok(data) = read_hive_from_record(
+                                    reader,
+                                    &record,
+                                    &name_upper,
+                                    &params,
+                                    partition_offset,
+                                ) {
+                                    if data.len() >= 0x1000 && &data[0..4] == b"regf" {
+                                        log::info!(
+                                            "MFTMirr scan: {} at record #{} has valid regf via zero-fill ({} bytes)",
+                                            name_upper, rec_num, data.len(),
+                                        );
+                                        *target = Some(record);
+                                    } else if data.len() >= 0x1000 {
+                                        // Check if data contains valid hbin blocks even without regf header
+                                        let has_hbin = data.windows(4).any(|w| w == b"hbin");
+                                        log::info!(
+                                            "MFTMirr scan: {} at record #{} no regf header ({} bytes, hbin present: {})",
+                                            name_upper, rec_num, data.len(), has_hbin,
+                                        );
+                                    }
+                                }
+                            }
                         }
 
                         if sam_record.is_some()

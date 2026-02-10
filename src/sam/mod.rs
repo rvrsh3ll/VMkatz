@@ -60,8 +60,13 @@ pub fn extract_disk_secrets(path: &Path) -> Result<DiskSecrets> {
         log::info!("Trying VMDK grain-direct scan for registry hives");
         let mut vmdk = crate::disk::vmdk::VmdkDisk::open(path)?;
         match scan_vmdk_grains_for_hives(&mut vmdk) {
-            Ok((sam_data, system_data, security_data)) => {
-                return process_hive_data(sam_data, system_data, security_data);
+            Ok(((sam_data, system_data, security_data), scattered_bootkey)) => {
+                return process_hive_data_with_bootkey(
+                    sam_data,
+                    system_data,
+                    security_data,
+                    scattered_bootkey,
+                );
             }
             Err(e) => {
                 log::info!("VMDK grain scan failed: {}", e);
@@ -123,14 +128,30 @@ fn process_hive_data(
     system_data: Vec<u8>,
     security_data: Option<Vec<u8>>,
 ) -> Result<DiskSecrets> {
+    process_hive_data_with_bootkey(sam_data, system_data, security_data, None)
+}
+
+/// Process extracted hive data with an optional pre-extracted bootkey.
+fn process_hive_data_with_bootkey(
+    sam_data: Vec<u8>,
+    system_data: Vec<u8>,
+    security_data: Option<Vec<u8>>,
+    precomputed_bootkey: Option<[u8; 16]>,
+) -> Result<DiskSecrets> {
     log::info!(
         "SAM hive: {} bytes, SYSTEM hive: {} bytes",
         sam_data.len(),
         system_data.len()
     );
 
-    // Extract bootkey from SYSTEM hive
-    let boot_key = bootkey::extract_bootkey(&system_data)?;
+    // Extract bootkey: prefer precomputed, fall back to SYSTEM hive
+    let boot_key = match precomputed_bootkey {
+        Some(bk) => {
+            log::info!("Using precomputed bootkey: {}", hex::encode(bk));
+            bk
+        }
+        None => bootkey::extract_bootkey(&system_data)?,
+    };
     log::info!("Bootkey: {}", hex::encode(boot_key));
 
     // Extract SAM hashes
@@ -883,7 +904,7 @@ fn try_read_hbin_hive<R: Read + Seek>(
 ///    chain them to rebuild hives fragmented by NTFS
 fn scan_vmdk_grains_for_hives(
     vmdk: &mut crate::disk::vmdk::VmdkDisk,
-) -> Result<HiveFiles> {
+) -> Result<(HiveFiles, Option<[u8; 16]>)> {
     use std::io::{Read as _, Seek as _, SeekFrom};
 
     log::info!("Starting VMDK grain-direct scan for registry hives");
@@ -1019,7 +1040,7 @@ fn scan_vmdk_grains_for_hives(
     }
 
     match (sam_data, system_data) {
-        (Some(sam), Some(system)) => return Ok((sam, system, security_data)),
+        (Some(sam), Some(system)) => return Ok(((sam, system, security_data), None)),
         (s, sys) => { sam_data = s; system_data = sys; }
     }
 
@@ -1097,7 +1118,7 @@ fn scan_vmdk_grains_for_hives(
     }
 
     match (sam_data, system_data) {
-        (Some(sam), Some(system)) => return Ok((sam, system, security_data)),
+        (Some(sam), Some(system)) => return Ok(((sam, system, security_data), None)),
         (s, sys) => { sam_data = s; system_data = sys; }
     }
 
@@ -1199,10 +1220,16 @@ fn scan_vmdk_grains_for_hives(
         }
     }
 
+    // Phase 3: Try scattered block bootkey extraction as fallback.
+    // When the SYSTEM hive has gaps (fragmented assembly), regular bootkey
+    // extraction may fail. Scanning individual hbin blocks can find bootkey
+    // NK cells that survived in available grains.
+    let scattered_bootkey = try_scattered_bootkey(vmdk, &all_hbin_blocks);
+
     let has_sam = sam_data.is_some();
     let has_system = system_data.is_some();
     if let (Some(sam), Some(system)) = (sam_data, system_data) {
-        Ok((sam, system, security_data))
+        Ok(((sam, system, security_data), scattered_bootkey))
     } else {
         let mut detail = "VMDK grain scan:".to_string();
         if !has_sam {
@@ -1224,6 +1251,47 @@ fn scan_vmdk_grains_for_hives(
         }
         Err(crate::error::GovmemError::DecryptionError(detail))
     }
+}
+
+/// Read all hbin blocks from VMDK and scan for bootkey NK cells.
+///
+/// This is a last-resort fallback: when the assembled SYSTEM hive has gaps
+/// (missing extents), tree navigation and the per-hive NK scan both fail.
+/// Here we read every physically present hbin block and search for
+/// JD/Skew1/GBG/Data NK cells with valid hex class names.
+fn try_scattered_bootkey(
+    vmdk: &mut crate::disk::vmdk::VmdkDisk,
+    all_hbin_blocks: &[(u64, u32, u32)],
+) -> Option<[u8; 16]> {
+    use std::io::{Read as _, Seek as _, SeekFrom};
+
+    if all_hbin_blocks.is_empty() {
+        return None;
+    }
+
+    log::info!(
+        "Trying scattered bootkey scan across {} hbin blocks",
+        all_hbin_blocks.len(),
+    );
+
+    let mut blocks: Vec<(u32, Vec<u8>)> = Vec::new();
+    for &(virt_off, off_in_hive, blk_size) in all_hbin_blocks {
+        // Limit block reads to reasonable sizes
+        if blk_size > 0x100000 {
+            continue;
+        }
+        if vmdk.seek(SeekFrom::Start(virt_off)).is_err() {
+            continue;
+        }
+        let mut data = vec![0u8; blk_size as usize];
+        if vmdk.read_exact(&mut data).is_err() {
+            continue;
+        }
+        blocks.push((off_in_hive, data));
+    }
+
+    log::info!("Read {} hbin blocks for scattered bootkey scan", blocks.len());
+    bootkey::scan_blocks_for_bootkey(&blocks)
 }
 
 /// Find matching regf headers for SAM/SYSTEM/SECURITY by path.
