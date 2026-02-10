@@ -66,7 +66,7 @@ const WIN10_EARLY_X64_EPROCESS: EprocessOffsets = EprocessOffsets {
     section_base_address: 0x3C0,
 };
 
-/// Windows 10 1703-22H2 (builds 15063-19045) / Server 2019/2022 / Windows 11
+/// Windows 10 1703-22H2 (builds 15063-19045) / Server 2019/2022 / Windows 11 21H2-23H2
 pub const WIN10_X64_EPROCESS: EprocessOffsets = EprocessOffsets {
     directory_table_base: 0x28,
     unique_process_id: 0x440,
@@ -74,6 +74,16 @@ pub const WIN10_X64_EPROCESS: EprocessOffsets = EprocessOffsets {
     image_file_name: 0x5A8,
     peb: 0x550,
     section_base_address: 0x520,
+};
+
+/// Windows 11 24H2+ (build 26100+) — EPROCESS fields shifted +8 from Win10
+const WIN11_24H2_X64_EPROCESS: EprocessOffsets = EprocessOffsets {
+    directory_table_base: 0x28,
+    unique_process_id: 0x448,
+    active_process_links: 0x450,
+    image_file_name: 0x5B0,
+    peb: 0x558,
+    section_base_address: 0x528,
 };
 
 /// LDR offsets — stable across Windows 7-11 x64.
@@ -101,8 +111,10 @@ pub fn offsets_for_build(build: u32) -> Result<EprocessOffsets> {
         9600 => Ok(WIN81_X64_EPROCESS),
         // Win10 1507-1607 / Server 2016
         10240..=14393 => Ok(WIN10_EARLY_X64_EPROCESS),
-        // Win10 1703+ / Server 2019/2022/2025 / Win11 (builds 15063-26100+)
-        15063..=29999 => Ok(WIN10_X64_EPROCESS),
+        // Win10 1703+ / Server 2019/2022 / Win11 21H2-23H2
+        15063..=26099 => Ok(WIN10_X64_EPROCESS),
+        // Win11 24H2+ (build 26100+)
+        26100..=29999 => Ok(WIN11_24H2_X64_EPROCESS),
         _ => Err(GovmemError::UnsupportedBuild(build)),
     }
 }
@@ -110,7 +122,8 @@ pub fn offsets_for_build(build: u32) -> Result<EprocessOffsets> {
 /// All known EPROCESS offset sets for brute-force scan (when build is unknown).
 /// Ordered by likelihood (most common first).
 pub const ALL_EPROCESS_OFFSETS: &[EprocessOffsets] = &[
-    WIN10_X64_EPROCESS,         // Win10 1703+ / Win11
+    WIN10_X64_EPROCESS,         // Win10 1703+ / Win11 21H2-23H2
+    WIN11_24H2_X64_EPROCESS,    // Win11 24H2+
     WIN10_EARLY_X64_EPROCESS,   // Win10 1507-1607
     WIN81_X64_EPROCESS,         // Win8.1
     WIN8_X64_EPROCESS,          // Win8

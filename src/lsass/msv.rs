@@ -1100,9 +1100,12 @@ fn extract_primary_credential(
     }
 
     // Try each offset variant and pick the one that makes sense.
-    // Validation: NT hash should be non-zero. LM hash is zero on most modern systems.
-    // SHA1 = SHA1(NT hash) provides cross-validation when NT is non-zero.
+    // Validation strategy:
+    //   1. SHA1(NT) == SHA1 field → strongest confirmation, accept immediately
+    //   2. SHA1 field is zero but NT looks like a hash (not ASCII text) → accept
+    //   3. If no variant passes, return error (don't guess)
     let mut best_result: Option<RawPrimaryCred> = None;
+    let mut best_entropy_result: Option<(usize, RawPrimaryCred)> = None;
 
     for (vi, offsets) in PRIMARY_CRED_OFFSET_VARIANTS.iter().enumerate() {
         let nt_off = offsets.nt_hash as usize;
@@ -1126,9 +1129,7 @@ fn extract_primary_credential(
         }
 
         // Cross-validate: SHA1(NT) should match sha1_hash (strongest validation)
-        let sha1_valid = sha1_digest(&nt_hash) == sha1_hash;
-
-        if sha1_valid {
+        if sha1_digest(&nt_hash) == sha1_hash {
             log::info!(
                 "  Using primary cred offset variant {} (nt=0x{:x}, lm=0x{:x}, sha1=0x{:x}) [SHA1 validated]",
                 vi, offsets.nt_hash, offsets.lm_hash, offsets.sha1_hash
@@ -1136,26 +1137,55 @@ fn extract_primary_credential(
             best_result = Some(RawPrimaryCred { lm_hash, nt_hash, sha1_hash });
             break;
         }
-    }
 
-    // Fallback: use first variant even if validation fails
-    if best_result.is_none() {
-        let offsets = &PRIMARY_CRED_OFFSET_VARIANTS[0];
-        let nt_off = offsets.nt_hash as usize;
-        let lm_off = offsets.lm_hash as usize;
-        let sha1_off = offsets.sha1_hash as usize;
-        let mut nt_hash = [0u8; 16];
-        let mut lm_hash = [0u8; 16];
-        let mut sha1_hash = [0u8; 20];
-        if decrypted.len() >= sha1_off + 20 {
-            nt_hash.copy_from_slice(&decrypted[nt_off..nt_off + 16]);
-            lm_hash.copy_from_slice(&decrypted[lm_off..lm_off + 16]);
-            sha1_hash.copy_from_slice(&decrypted[sha1_off..sha1_off + 20]);
+        // SHA1 field is zero but NT hash looks valid: on some builds (Win7/2012)
+        // the SHA1 field may not be stored. Accept if NT hash has hash-like entropy
+        // (reject if it contains UTF-16 text patterns like 0x00 every other byte).
+        if sha1_hash == [0u8; 20] && looks_like_hash(&nt_hash) {
+            if best_entropy_result.is_none() {
+                log::info!(
+                    "  Candidate primary cred offset variant {} (nt=0x{:x}) [SHA1 not stored, entropy ok]",
+                    vi, offsets.nt_hash
+                );
+                // Compute SHA1 ourselves since it wasn't stored
+                let computed_sha1 = sha1_digest(&nt_hash);
+                best_entropy_result = Some((vi, RawPrimaryCred { lm_hash, nt_hash, sha1_hash: computed_sha1 }));
+            }
         }
-        best_result = Some(RawPrimaryCred { lm_hash, nt_hash, sha1_hash });
     }
 
-    Ok(best_result.unwrap())
+    // Use SHA1-validated result, or entropy-based result
+    if best_result.is_none() {
+        if let Some((vi, cred)) = best_entropy_result {
+            log::info!(
+                "  Using primary cred offset variant {} [entropy-based, SHA1 computed]", vi
+            );
+            best_result = Some(cred);
+        }
+    }
+
+    best_result.ok_or_else(|| {
+        crate::error::GovmemError::DecryptionError(
+            "No offset variant matched (SHA1 cross-validation and entropy check both failed)".to_string(),
+        )
+    })
+}
+
+/// Check if 16 bytes look like a hash rather than UTF-16 text or structured data.
+/// UTF-16 text has 0x00 at every other byte (for ASCII chars in UTF-16LE).
+/// Structured data with boolean flags has patterns like 01 01 01 00.
+fn looks_like_hash(data: &[u8; 16]) -> bool {
+    // Count zero bytes — UTF-16LE ASCII has ~50% zero bytes
+    let zero_count = data.iter().filter(|&&b| b == 0).count();
+    if zero_count >= 6 {
+        return false; // Too many zeros for a hash — likely UTF-16 text
+    }
+    // Check for alternating zero pattern (UTF-16LE): xx 00 xx 00
+    let utf16_pattern = data.chunks(2).filter(|c| c.len() == 2 && c[1] == 0 && c[0] != 0).count();
+    if utf16_pattern >= 5 {
+        return false; // Strongly resembles UTF-16LE text
+    }
+    true
 }
 
 /// Minimal inline SHA-1 for cross-validating NT hash against SHA1 field.
