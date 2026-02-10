@@ -41,6 +41,8 @@ use vmkatz::windows::process;
         vmkatz disk.vdi                             Extract SAM hashes + LSA secrets\n  \
         vmkatz /path/to/vm/directory/               Auto-discover and process all files\n  \
         vmkatz --list-processes snapshot.vmsn        List running processes only\n  \
+        vmkatz --dump lsass snapshot.vmsn           Dump LSASS as minidump for pypykatz\n  \
+        vmkatz --dump lsass -o out.dmp snap.vmsn    Dump with custom output filename\n  \
         vmkatz -v snapshot.vmsn                     Verbose output with process list",
 )]
 struct Args {
@@ -61,6 +63,18 @@ struct Args {
     #[cfg(feature = "sam")]
     #[arg(long, value_name = "DISK_IMAGE")]
     disk: Option<String>,
+
+    /// Dump a process's virtual memory as minidump (.dmp) file
+    #[arg(long, value_name = "PROCESS_NAME")]
+    dump: Option<String>,
+
+    /// Output file for --dump (default: <process>.dmp)
+    #[arg(short, long, value_name = "FILE")]
+    output: Option<String>,
+
+    /// Windows build number for minidump header (default: 19045)
+    #[arg(long, default_value_t = 19045, value_name = "NUMBER")]
+    build: u32,
 
     /// Output format
     #[arg(long, default_value = "text", value_name = "FORMAT", value_parser = ["text", "csv", "ntlm"])]
@@ -397,6 +411,32 @@ fn run_with_layer<L: PhysicalMemory, F: FnOnce() -> anyhow::Result<L>>(
         return Ok(());
     }
 
+    // Process dump mode
+    if let Some(ref dump_name) = args.dump {
+        let target = find_process_by_name(&processes, dump_name)
+            .ok_or_else(|| anyhow::anyhow!("Process '{}' not found in process list", dump_name))?;
+
+        let default_output = format!("{}.dmp", dump_name.to_lowercase().trim_end_matches(".exe"));
+        let output = args.output.as_deref().unwrap_or(&default_output);
+        let output_path = std::path::Path::new(output);
+
+        println!(
+            "[*] Dumping {} (PID={}, DTB=0x{:x})...",
+            target.name, target.pid, target.dtb
+        );
+
+        vmkatz::dump::dump_process(&layer, target, args.build, output_path, pagefile, disk_path)?;
+
+        let file_size = std::fs::metadata(output_path).map(|m| m.len()).unwrap_or(0);
+        println!(
+            "[+] Dumped {} → {} ({:.1} MB)",
+            target.name,
+            output,
+            file_size as f64 / (1024.0 * 1024.0)
+        );
+        return Ok(());
+    }
+
     // Find LSASS
     let lsass_proc = processes
         .iter()
@@ -431,6 +471,24 @@ fn run_with_layer<L: PhysicalMemory, F: FnOnce() -> anyhow::Result<L>>(
     }
 
     Ok(())
+}
+
+#[cfg(any(feature = "vmware", feature = "vbox"))]
+fn find_process_by_name<'a>(
+    processes: &'a [vmkatz::windows::process::Process],
+    name: &str,
+) -> Option<&'a vmkatz::windows::process::Process> {
+    // Try exact match (case-insensitive)
+    processes
+        .iter()
+        .find(|p| p.name.eq_ignore_ascii_case(name))
+        .or_else(|| {
+            // Try with .exe appended
+            let with_exe = format!("{}.exe", name);
+            processes
+                .iter()
+                .find(|p| p.name.eq_ignore_ascii_case(&with_exe))
+        })
 }
 
 #[cfg(any(feature = "vmware", feature = "vbox"))]

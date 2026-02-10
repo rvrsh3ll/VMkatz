@@ -13,3 +13,4 @@ pub mod disk;
 #[cfg(feature = "sam")]
 pub mod sam;
 pub mod discover;
+pub mod dump;
