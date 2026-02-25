@@ -1420,6 +1420,13 @@ fn print_text(credentials: &[Credential], c: &Colors) {
             if !krb.password.is_empty() {
                 println!("    Password: {}{}{}", c.red, krb.password, c.reset);
             }
+            for key in &krb.keys {
+                println!(
+                    "    {:11}: {}",
+                    key.etype_name(),
+                    hex::encode(&key.key)
+                );
+            }
             for ticket in &krb.tickets {
                 println!(
                     "    [{}] {}",

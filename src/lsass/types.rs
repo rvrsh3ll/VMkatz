@@ -115,12 +115,37 @@ pub struct WdigestCredential {
     pub password: String,
 }
 
+/// Kerberos encryption key (AES128, AES256, RC4/NTLM, DES).
+#[derive(Debug)]
+pub struct KerberosKey {
+    /// Kerberos encryption type (etype): 17=AES128, 18=AES256, 23=RC4, 3=DES
+    pub etype: u32,
+    /// Raw key bytes
+    pub key: Vec<u8>,
+}
+
+impl KerberosKey {
+    /// Human-readable encryption type name.
+    pub fn etype_name(&self) -> &'static str {
+        match self.etype {
+            1 => "DES_CBC_CRC",
+            3 => "DES_CBC_MD5",
+            17 => "AES128_HMAC",
+            18 => "AES256_HMAC",
+            23 => "RC4_HMAC",
+            24 => "RC4_HMAC_EXP",
+            _ => "Unknown",
+        }
+    }
+}
+
 /// Kerberos credential.
 #[derive(Debug)]
 pub struct KerberosCredential {
     pub username: String,
     pub domain: String,
     pub password: String,
+    pub keys: Vec<KerberosKey>,
     pub tickets: Vec<KerberosTicket>,
 }
 
@@ -249,7 +274,7 @@ impl Credential {
             || self
                 .kerberos
                 .as_ref()
-                .is_some_and(|k| !k.password.is_empty() || !k.tickets.is_empty())
+                .is_some_and(|k| !k.password.is_empty() || !k.keys.is_empty() || !k.tickets.is_empty())
             || self.tspkg.as_ref().is_some_and(|t| !t.password.is_empty())
             || !self.dpapi.is_empty()
             || !self.credman.is_empty()
@@ -312,6 +337,14 @@ impl std::fmt::Display for Credential {
             writeln!(f, "  [Kerberos]")?;
             if !krb.password.is_empty() {
                 writeln!(f, "    Password: {}", krb.password)?;
+            }
+            for key in &krb.keys {
+                writeln!(
+                    f,
+                    "    {:11}: {}",
+                    key.etype_name(),
+                    hex::encode(&key.key)
+                )?;
             }
             for ticket in &krb.tickets {
                 writeln!(

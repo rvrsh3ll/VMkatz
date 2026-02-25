@@ -1080,6 +1080,7 @@ fn scan_phys_for_kerberos_credentials<P: PhysicalMemory>(
                 username,
                 domain,
                 password,
+                keys: Vec::new(),
                 tickets: Vec::new(),
             },
         ));

