@@ -134,6 +134,14 @@ struct Args {
     #[arg(long, default_value = "auto", value_name = "WHEN", value_parser = ["auto", "always", "never"])]
     color: String,
 
+    /// Export Kerberos tickets as .kirbi files to a directory
+    #[arg(long, value_name = "DIR")]
+    kirbi: Option<String>,
+
+    /// Export Kerberos tickets as a single ccache file (MIT Kerberos format)
+    #[arg(long, value_name = "FILE")]
+    ccache: Option<String>,
+
     /// Verbose output (show memory regions, process list, etc.)
     #[arg(short, long, default_value_t = false)]
     verbose: bool,
@@ -1319,6 +1327,9 @@ fn run_with_system<L: PhysicalMemory>(
         }
     }
 
+    // Export Kerberos tickets if requested
+    export_kerberos_tickets(&credentials, args);
+
     let c = get_colors(args);
     match args.format.as_str() {
         "csv" => print_csv(&credentials),
@@ -1351,6 +1362,191 @@ fn find_process_by_name<'a>(
                 .iter()
                 .find(|p| p.name.eq_ignore_ascii_case(&with_exe))
         })
+}
+
+// ---------------------------------------------------------------------------
+// Kerberos ticket export (--kirbi, --ccache)
+// ---------------------------------------------------------------------------
+
+/// Export Kerberos tickets from credentials if --kirbi or --ccache is set.
+fn export_kerberos_tickets(credentials: &[Credential], args: &Args) {
+    if args.kirbi.is_none() && args.ccache.is_none() {
+        return;
+    }
+
+    // Collect all tickets with their context
+    let mut all_tickets: Vec<(&vmkatz::lsass::types::KerberosTicket, &str, &str)> = Vec::new();
+    for cred in credentials {
+        if let Some(krb) = &cred.kerberos {
+            for ticket in &krb.tickets {
+                all_tickets.push((ticket, &krb.username, &krb.domain));
+            }
+        }
+    }
+
+    if all_tickets.is_empty() {
+        println!("[*] No Kerberos tickets to export");
+        return;
+    }
+
+    // --kirbi: write individual .kirbi files
+    if let Some(dir) = &args.kirbi {
+        let dir_path = std::path::Path::new(dir);
+        if !dir_path.exists() {
+            if let Err(e) = std::fs::create_dir_all(dir_path) {
+                eprintln!("[!] Failed to create kirbi directory {}: {}", dir, e);
+                return;
+            }
+        }
+        let mut count = 0;
+        for (ticket, username, _domain) in &all_tickets {
+            if ticket.kirbi.is_empty() {
+                continue;
+            }
+            let svc = ticket.service_name.join("-");
+            let filename = format!(
+                "{}_{}_{}.kirbi",
+                sanitize_filename(username),
+                ticket.ticket_type,
+                sanitize_filename(&svc)
+            );
+            let path = dir_path.join(&filename);
+            match std::fs::write(&path, &ticket.kirbi) {
+                Ok(_) => {
+                    count += 1;
+                    log::debug!("Wrote {}", path.display());
+                }
+                Err(e) => eprintln!("[!] Failed to write {}: {}", path.display(), e),
+            }
+        }
+        println!("[+] Exported {} .kirbi ticket(s) to {}", count, dir);
+    }
+
+    // --ccache: write all tickets into a single ccache file
+    if let Some(ccache_path) = &args.ccache {
+        let data = build_ccache(&all_tickets);
+        match std::fs::write(ccache_path, &data) {
+            Ok(_) => println!(
+                "[+] Exported {} ticket(s) to {} ({} bytes)",
+                all_tickets.len(),
+                ccache_path,
+                data.len()
+            ),
+            Err(e) => eprintln!("[!] Failed to write {}: {}", ccache_path, e),
+        }
+    }
+}
+
+/// Sanitize a string for use in a filename.
+fn sanitize_filename(s: &str) -> String {
+    s.chars()
+        .map(|c| match c {
+            '/' | '\\' | ':' | '*' | '?' | '"' | '<' | '>' | '|' | ' ' | '$' => '_',
+            _ => c,
+        })
+        .collect()
+}
+
+/// Build a ccache (MIT Kerberos credential cache) file.
+/// Format: v4 (0x0504), one default principal, N credentials.
+fn build_ccache(
+    tickets: &[(&vmkatz::lsass::types::KerberosTicket, &str, &str)],
+) -> Vec<u8> {
+    let mut out = Vec::new();
+
+    // File format version: 0x0504 (v4)
+    out.extend_from_slice(&[0x05, 0x04]);
+
+    // Header tags (v4): 2-byte header length, then tag entries
+    // We use a single empty header (length = 0)
+    out.extend_from_slice(&0u16.to_be_bytes());
+
+    // Default principal: use the first ticket's client
+    if let Some((ticket, _username, _domain)) = tickets.first() {
+        let realm = &ticket.domain_name;
+        let client = &ticket.client_name;
+        write_ccache_principal(&mut out, ticket.client_name_type as u32, realm, client);
+    } else {
+        // Empty principal
+        write_ccache_principal(&mut out, 1, "", &[]);
+    }
+
+    // Credentials
+    for (ticket, _username, _domain) in tickets {
+        if ticket.ticket_blob.is_empty() {
+            continue;
+        }
+        write_ccache_credential(&mut out, ticket);
+    }
+
+    out
+}
+
+/// Write a principal to ccache format.
+/// Format: name_type (u32), num_components (u32), realm (counted_octet_string),
+///         components[num] (counted_octet_string each)
+fn write_ccache_principal(out: &mut Vec<u8>, name_type: u32, realm: &str, components: &[String]) {
+    out.extend_from_slice(&name_type.to_be_bytes());
+    out.extend_from_slice(&(components.len() as u32).to_be_bytes());
+    // Realm
+    write_ccache_string(out, realm);
+    // Components
+    for comp in components {
+        write_ccache_string(out, comp);
+    }
+}
+
+fn write_ccache_string(out: &mut Vec<u8>, s: &str) {
+    out.extend_from_slice(&(s.len() as u32).to_be_bytes());
+    out.extend_from_slice(s.as_bytes());
+}
+
+/// Write a single credential entry in ccache format.
+fn write_ccache_credential(out: &mut Vec<u8>, ticket: &vmkatz::lsass::types::KerberosTicket) {
+    // Client principal
+    let client_realm = &ticket.domain_name;
+    write_ccache_principal(out, ticket.client_name_type as u32, client_realm, &ticket.client_name);
+
+    // Server principal
+    let server_realm = &ticket.target_domain_name;
+    write_ccache_principal(out, ticket.service_name_type as u32, server_realm, &ticket.service_name);
+
+    // Keyblock: keytype (u16), etype (u16 = 0 for ccache v4), keylength (u16), keyvalue
+    // ccache v4 uses: enc_type (u16), key_length (u32), key_data
+    out.extend_from_slice(&(ticket.key_type as u16).to_be_bytes());
+    out.extend_from_slice(&(ticket.session_key.len() as u32).to_be_bytes());
+    out.extend_from_slice(&ticket.session_key);
+
+    // Times: authtime, starttime, endtime, renew_till (each u32, unix timestamp)
+    let to_unix = |ft: u64| -> u32 {
+        if ft == 0 {
+            return 0;
+        }
+        ((ft / 10_000_000).saturating_sub(11_644_473_600)) as u32
+    };
+    out.extend_from_slice(&to_unix(ticket.start_time).to_be_bytes()); // authtime
+    out.extend_from_slice(&to_unix(ticket.start_time).to_be_bytes()); // starttime
+    out.extend_from_slice(&to_unix(ticket.end_time).to_be_bytes()); // endtime
+    out.extend_from_slice(&to_unix(ticket.renew_until).to_be_bytes()); // renew_till
+
+    // is_skey: u8 (0)
+    out.push(0);
+
+    // ticket_flags: u32 (big-endian, already stored as big-endian in our struct)
+    out.extend_from_slice(&ticket.ticket_flags.to_be_bytes());
+
+    // Addresses: count (u32) = 0
+    out.extend_from_slice(&0u32.to_be_bytes());
+
+    // Authdata: count (u32) = 0
+    out.extend_from_slice(&0u32.to_be_bytes());
+
+    // Ticket (the actual encrypted ticket blob)
+    out.extend_from_slice(&(ticket.ticket_blob.len() as u32).to_be_bytes());
+    out.extend_from_slice(&ticket.ticket_blob);
+
+    // Second ticket: length = 0
+    out.extend_from_slice(&0u32.to_be_bytes());
 }
 
 #[cfg(any(
