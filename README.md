@@ -105,6 +105,10 @@ cargo build --release
 | `hashcat` | `--format hashcat` | Raw hashes: mode 1000 (NTLM), mode 2100 (DCC2) |
 | `csv` | `--format csv` | Machine-readable, all fields |
 
+In `text` mode, well-known blank password hashes (`31d6cfe0...` for NTLM, `aad3b435...` for LM) are annotated with `(blank)`.
+
+Use `--color auto|always|never` to control colored terminal output (default: `auto`, detects TTY). Colors highlight usernames, section headers, interesting hashes, and plaintext passwords.
+
 ## Example Output
 
 ### LSASS extraction (default text)
@@ -129,7 +133,6 @@ $ vmkatz snapshot.vmsn
   LogonServer: YOURPC
   SID: S-1-5-21-4247878743-2693906039-1959858616-1000
   [MSV1_0]
-    LM Hash : 00000000000000000000000000000000
     NT Hash : bbf7d1528afa8b0fdd40a5b2531bbb6d
     SHA1    : 6ed12f1e60b17cfff120d753029314748b58aa05
     DPAPI   : 6ed12f1e60b17cfff120d753029314748b58aa05
@@ -154,9 +157,9 @@ $ vmkatz --ntds /dev/pve/vm-102-disk-0
   Hashes extracted : 18
 
 [+] AD NTLM Hashes:
-  RID: 500    Administrator            current    NT:c66d72021a2d4744409969a581a1705e  LM:00000000000000000000000000000000
-  RID: 502    krbtgt                   current    NT:9c238cafb7b4447e5f701c71dbdcf636  LM:00000000000000000000000000000000
-  RID: 1000   vagrant                  current    NT:e02bc503339d51f71d913c245d35b50b  LM:00000000000000000000000000000000
+  RID: 500    Administrator            current    NT:c66d72021a2d4744409969a581a1705e
+  RID: 502    krbtgt                   current    NT:9c238cafb7b4447e5f701c71dbdcf636
+  RID: 1000   vagrant                  current    NT:e02bc503339d51f71d913c245d35b50b
   ...
 ```
 
@@ -266,3 +269,11 @@ Tested across 7 Windows versions and 4 hypervisors.
 5. **Disk extraction**: Parses the virtual disk container (sparse VMDK, VDI, QCOW2, VHDX, VHD), finds the Windows partition (MBR/GPT), walks NTFS MFT to locate `SAM`, `SYSTEM`, `SECURITY` hives, and decrypts hashes using the boot key.
 
 6. **NTDS extraction**: For domain controllers (`--ntds`), locates `NTDS.dit` and the `SYSTEM` hive on disk, then parses the ESE (JET Blue) database natively. Traverses B+ trees to read the `datatable`, extracts the PEK (Password Encryption Key) using the bootkey, and decrypts NT/LM hashes for every AD account. Supports both 8KB pages (Windows Server 2019 and earlier) and 32KB large pages (Windows Server 2025), as well as RC4 (legacy), AES pre-Win2016, and AES Win2016+ (v0x13) hash blob formats.
+
+## Acknowledgements
+
+VMkatz builds on the foundational work of several projects that mapped out Windows credential internals:
+
+- [**mimikatz**](https://github.com/gentilkiwi/mimikatz) by Benjamin Delpy ([@gentilkiwi](https://twitter.com/gentilkiwi)) -- the original Windows credential extraction tool. mimikatz's source code is the definitive reference for LSASS internals: SSP structures, crypto key resolution, credential decryption across Windows versions. VMkatz's 9-provider extraction pipeline follows the architecture Benjamin documented.
+- [**pypykatz**](https://github.com/skelsec/pypykatz) by Tamás Jós ([@skelsec](https://twitter.com/skaborern)) -- a pure Python reimplementation of mimikatz credential parsing. pypykatz's clean separation of minidump reading from credential decryption informed VMkatz's design, and its SAM/LSA/DCC2 extraction logic served as a cross-reference for offline registry decryption.
+- [**Impacket**](https://github.com/fortra/impacket) by Fortra (originally by Alberto Solino [@agsolino](https://twitter.com/agsolino)) -- the standard Python library for Windows network protocols. Impacket's `secretsdump.py` is the reference implementation for NTDS.dit extraction, SAM dumping, and the pwdump output format that VMkatz's `--format ntlm` follows.

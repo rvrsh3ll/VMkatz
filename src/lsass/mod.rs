@@ -1,6 +1,7 @@
 pub(crate) mod cloudap;
 pub(crate) mod credman;
 pub(crate) mod crypto;
+pub use crypto::base64_encode;
 pub(crate) mod dpapi;
 pub mod finder;
 pub(crate) mod kerberos;

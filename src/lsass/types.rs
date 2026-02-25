@@ -1,5 +1,5 @@
 /// Convert Windows FILETIME (100-ns ticks since 1601-01-01) to a readable string.
-fn filetime_to_string(ft: u64) -> String {
+pub fn filetime_to_string(ft: u64) -> String {
     if ft == 0 || ft == 0x7FFF_FFFF_FFFF_FFFF {
         return "N/A".to_string();
     }
@@ -57,7 +57,7 @@ fn filetime_to_string(ft: u64) -> String {
 }
 
 /// Human-readable Windows logon type.
-fn logon_type_name(lt: u32) -> &'static str {
+pub fn logon_type_name(lt: u32) -> &'static str {
     match lt {
         0 => "UndefinedLogonType",
         2 => "Interactive",

@@ -123,9 +123,97 @@ struct Args {
     #[arg(long, default_value = "text", value_name = "FORMAT", value_parser = ["text", "csv", "ntlm", "hashcat"])]
     format: String,
 
+    /// Color output (auto=detect terminal, always, never)
+    #[arg(long, default_value = "auto", value_name = "WHEN", value_parser = ["auto", "always", "never"])]
+    color: String,
+
     /// Verbose output (show memory regions, process list, etc.)
     #[arg(short, long, default_value_t = false)]
     verbose: bool,
+}
+
+// ---------------------------------------------------------------------------
+// Terminal color support
+// ---------------------------------------------------------------------------
+
+/// ANSI color escape sequences (empty strings when disabled).
+#[allow(dead_code)]
+struct Colors {
+    reset: &'static str,
+    bold: &'static str,
+    dim: &'static str,
+    green: &'static str,
+    yellow: &'static str,
+    cyan: &'static str,
+    red: &'static str,
+}
+
+const COLORS_ON: Colors = Colors {
+    reset: "\x1b[0m",
+    bold: "\x1b[1m",
+    dim: "\x1b[2m",
+    green: "\x1b[32m",
+    yellow: "\x1b[33m",
+    cyan: "\x1b[36m",
+    red: "\x1b[31m",
+};
+
+const COLORS_OFF: Colors = Colors {
+    reset: "",
+    bold: "",
+    dim: "",
+    green: "",
+    yellow: "",
+    cyan: "",
+    red: "",
+};
+
+fn get_colors(args: &Args) -> &'static Colors {
+    use std::io::IsTerminal;
+    match args.color.as_str() {
+        "always" => &COLORS_ON,
+        "never" => &COLORS_OFF,
+        _ => {
+            if std::io::stdout().is_terminal() {
+                &COLORS_ON
+            } else {
+                &COLORS_OFF
+            }
+        }
+    }
+}
+
+// ---------------------------------------------------------------------------
+// Blank hash detection
+// ---------------------------------------------------------------------------
+
+/// NT hash of empty password (NTLM(""))
+const BLANK_NT_HEX: &str = "31d6cfe0d16ae931b73c59d7e0c089c0";
+/// LM hash of empty password (LanMan(""))
+/// Used as placeholder in pwdump format when LM hashing is disabled.
+const BLANK_LM_HEX: &str = "aad3b435b51404eeaad3b435b51404ee";
+
+const ZERO_HASH_16: [u8; 16] = [0u8; 16];
+
+/// Format a hash with blank annotation and optional color.
+fn fmt_hash(hash: &[u8], c: &Colors) -> String {
+    let h = hex::encode(hash);
+    if hash.iter().all(|&b| b == 0) {
+        return format!("{}{}{}", c.dim, h, c.reset);
+    }
+    if h == BLANK_NT_HEX || h == BLANK_LM_HEX {
+        return format!("{}{} (blank){}", c.dim, h, c.reset);
+    }
+    format!("{}{}{}", c.yellow, h, c.reset)
+}
+
+/// Format LM hash for pwdump output: zero → standard empty LM placeholder.
+fn fmt_lm_pwdump(hash: &[u8; 16]) -> String {
+    if *hash == ZERO_HASH_16 {
+        BLANK_LM_HEX.to_string()
+    } else {
+        hex::encode(hash)
+    }
 }
 
 fn main() -> anyhow::Result<()> {
@@ -216,21 +304,23 @@ fn run_sam(input_path: &Path, args: &Args) -> anyhow::Result<()> {
     let secrets =
         vmkatz::sam::extract_disk_secrets(input_path).context("Disk secrets extraction failed")?;
 
+    let c = get_colors(args);
+
     match args.format.as_str() {
         "ntlm" => print_sam_ntlm(&secrets.sam_entries),
         "csv" => print_sam_csv(&secrets.sam_entries),
         "hashcat" => print_sam_hashcat(&secrets.sam_entries),
-        _ => print_sam_text(&secrets.sam_entries),
+        _ => print_sam_text(&secrets.sam_entries, c),
     }
 
     if !secrets.lsa_secrets.is_empty() && args.format != "hashcat" {
-        print_lsa_secrets(&secrets.lsa_secrets);
+        print_lsa_secrets(&secrets.lsa_secrets, c);
     }
 
     if !secrets.cached_credentials.is_empty() {
         match args.format.as_str() {
             "hashcat" => print_dcc2_hashcat(&secrets.cached_credentials),
-            _ => print_cached_credentials(&secrets.cached_credentials),
+            _ => print_cached_credentials(&secrets.cached_credentials, c),
         }
     }
 
@@ -254,7 +344,9 @@ fn run_ntds(input_path: &Path, args: &Args) -> anyhow::Result<()> {
     )
     .context("NTDS hash extraction failed")?;
 
-    println!("\n[+] NTDS Artifacts:");
+    let c = get_colors(args);
+
+    println!("\n{}[+] NTDS Artifacts:{}", c.green, c.reset);
     println!("  Partition offset : 0x{:x}", artifacts.partition_offset);
     println!("  ntds.dit size    : {} bytes", ctx.ntds_size);
     println!("  SYSTEM size      : {} bytes", artifacts.system_data.len());
@@ -265,15 +357,15 @@ fn run_ntds(input_path: &Path, args: &Args) -> anyhow::Result<()> {
         "csv" => print_ntds_csv(&hashes),
         "hashcat" => print_ntds_hashcat(&hashes),
         "ntlm" => print_ntds_ntlm(&hashes),
-        _ => print_ntds_text(&hashes),
+        _ => print_ntds_text(&hashes, c),
     }
 
     Ok(())
 }
 
 #[cfg(feature = "ntds.dit")]
-fn print_ntds_text(entries: &[vmkatz::ntds::AdHashEntry]) {
-    println!("\n[+] AD NTLM Hashes:");
+fn print_ntds_text(entries: &[vmkatz::ntds::AdHashEntry], c: &Colors) {
+    println!("\n{}[+] AD NTLM Hashes:{}", c.green, c.reset);
     for entry in entries {
         let hist = if entry.is_history {
             match entry.history_index {
@@ -283,14 +375,20 @@ fn print_ntds_text(entries: &[vmkatz::ntds::AdHashEntry]) {
         } else {
             "current".to_string()
         };
-        println!(
-            "  RID: {:<6} {:<24} {:<10} NT:{}  LM:{}",
-            entry.rid,
-            entry.username,
-            hist,
-            hex::encode(entry.nt_hash),
-            hex::encode(entry.lm_hash),
-        );
+        if entry.lm_hash != ZERO_HASH_16 {
+            println!(
+                "  RID: {:<6} {}{:<24}{} {:<10} NT:{}  LM:{}",
+                entry.rid, c.bold, entry.username, c.reset, hist,
+                fmt_hash(&entry.nt_hash, c),
+                fmt_hash(&entry.lm_hash, c),
+            );
+        } else {
+            println!(
+                "  RID: {:<6} {}{:<24}{} {:<10} NT:{}",
+                entry.rid, c.bold, entry.username, c.reset, hist,
+                fmt_hash(&entry.nt_hash, c),
+            );
+        }
     }
 }
 
@@ -310,7 +408,7 @@ fn print_ntds_ntlm(entries: &[vmkatz::ntds::AdHashEntry]) {
             "{}:{}:{}:{}:::",
             user,
             entry.rid,
-            hex::encode(entry.lm_hash),
+            fmt_lm_pwdump(&entry.lm_hash),
             hex::encode(entry.nt_hash),
         );
     }
@@ -331,7 +429,7 @@ fn print_ntds_csv(entries: &[vmkatz::ntds::AdHashEntry]) {
             entry.is_history,
             history_index,
             hex::encode(entry.nt_hash),
-            hex::encode(entry.lm_hash),
+            fmt_lm_pwdump(&entry.lm_hash),
         );
     }
 }
@@ -347,16 +445,23 @@ fn print_ntds_hashcat(entries: &[vmkatz::ntds::AdHashEntry]) {
 }
 
 #[cfg(feature = "sam")]
-fn print_sam_text(entries: &[vmkatz::sam::SamEntry]) {
-    println!("\n[+] SAM Hashes:");
+fn print_sam_text(entries: &[vmkatz::sam::SamEntry], c: &Colors) {
+    println!("\n{}[+] SAM Hashes:{}", c.green, c.reset);
     for entry in entries {
-        println!(
-            "  RID: {:<5} {:<20} NT:{}  LM:{}",
-            entry.rid,
-            entry.username,
-            hex::encode(entry.nt_hash),
-            hex::encode(entry.lm_hash),
-        );
+        if entry.lm_hash != ZERO_HASH_16 {
+            println!(
+                "  RID: {:<5} {}{:<20}{}  NT:{}  LM:{}",
+                entry.rid, c.bold, entry.username, c.reset,
+                fmt_hash(&entry.nt_hash, c),
+                fmt_hash(&entry.lm_hash, c),
+            );
+        } else {
+            println!(
+                "  RID: {:<5} {}{:<20}{}  NT:{}",
+                entry.rid, c.bold, entry.username, c.reset,
+                fmt_hash(&entry.nt_hash, c),
+            );
+        }
     }
 }
 
@@ -367,7 +472,7 @@ fn print_sam_ntlm(entries: &[vmkatz::sam::SamEntry]) {
             "{}:{}:{}:{}:::",
             entry.username,
             entry.rid,
-            hex::encode(entry.lm_hash),
+            fmt_lm_pwdump(&entry.lm_hash),
             hex::encode(entry.nt_hash),
         );
     }
@@ -382,7 +487,7 @@ fn print_sam_csv(entries: &[vmkatz::sam::SamEntry]) {
             entry.rid,
             entry.username,
             hex::encode(entry.nt_hash),
-            hex::encode(entry.lm_hash),
+            fmt_lm_pwdump(&entry.lm_hash),
         );
     }
 }
@@ -412,16 +517,16 @@ fn print_dcc2_hashcat(creds: &[vmkatz::sam::cache::CachedCredential]) {
 }
 
 #[cfg(feature = "sam")]
-fn print_lsa_secrets(secrets: &[vmkatz::sam::lsa::LsaSecret]) {
-    println!("\n[+] LSA Secrets:");
+fn print_lsa_secrets(secrets: &[vmkatz::sam::lsa::LsaSecret], c: &Colors) {
+    println!("\n{}[+] LSA Secrets:{}", c.green, c.reset);
     for secret in secrets {
         println!("{}", secret);
     }
 }
 
 #[cfg(feature = "sam")]
-fn print_cached_credentials(creds: &[vmkatz::sam::cache::CachedCredential]) {
-    println!("\n[+] Domain Cached Credentials (DCC2):");
+fn print_cached_credentials(creds: &[vmkatz::sam::cache::CachedCredential], c: &Colors) {
+    println!("\n{}[+] Domain Cached Credentials (DCC2):{}", c.green, c.reset);
     for cred in creds {
         println!("{}", cred);
     }
@@ -954,11 +1059,12 @@ fn run_with_system<L: PhysicalMemory>(
         }
     }
 
+    let c = get_colors(args);
     match args.format.as_str() {
         "csv" => print_csv(&credentials),
         "ntlm" => print_ntlm(&credentials),
         "hashcat" => print_hashcat(&credentials),
-        _ => print_text(&credentials),
+        _ => print_text(&credentials, c),
     }
 
     Ok(())
@@ -993,15 +1099,138 @@ fn find_process_by_name<'a>(
     feature = "qemu",
     feature = "hyperv"
 ))]
-fn print_text(credentials: &[Credential]) {
-    let with_creds = credentials.iter().filter(|c| c.has_credentials()).count();
+fn print_text(credentials: &[Credential], c: &Colors) {
+    use vmkatz::lsass::types::{filetime_to_string, logon_type_name};
+
+    let with_creds = credentials.iter().filter(|cr| cr.has_credentials()).count();
     println!(
-        "\n[+] {} logon session(s), {} with credentials:\n",
-        credentials.len(),
-        with_creds,
+        "\n{}[+]{} {} logon session(s), {} with credentials:\n",
+        c.green, c.reset, credentials.len(), with_creds,
     );
     for cred in credentials {
-        println!("{}", cred);
+        // LUID header
+        let luid_label = match cred.luid {
+            0x3e7 => " (SYSTEM)",
+            0x3e4 => " (NETWORK SERVICE)",
+            0x3e5 => " (LOCAL SERVICE)",
+            0x3e3 => " (IUSER)",
+            _ => "",
+        };
+        println!("  {}LUID: 0x{:x}{}{}", c.bold, cred.luid, luid_label, c.reset);
+        if cred.session_id != 0 || cred.logon_type != 0 {
+            println!(
+                "  Session: {} | LogonType: {}",
+                cred.session_id,
+                logon_type_name(cred.logon_type)
+            );
+        }
+        println!("  {}Username: {}{}", c.bold, cred.username, c.reset);
+        println!("  Domain: {}", cred.domain);
+        if !cred.logon_server.is_empty() {
+            println!("  LogonServer: {}", cred.logon_server);
+        }
+        if cred.logon_time != 0 {
+            println!("  LogonTime: {}", filetime_to_string(cred.logon_time));
+        }
+        if !cred.sid.is_empty() {
+            println!("  SID: {}", cred.sid);
+        }
+        if !cred.has_credentials() {
+            println!("  {}(no credentials extracted - paged out){}", c.dim, c.reset);
+            println!();
+            continue;
+        }
+        if let Some(msv) = &cred.msv {
+            println!("  {}[MSV1_0]{}", c.cyan, c.reset);
+            if msv.lm_hash != ZERO_HASH_16 {
+                println!("    LM Hash : {}", fmt_hash(&msv.lm_hash, c));
+            }
+            println!("    NT Hash : {}", fmt_hash(&msv.nt_hash, c));
+            println!("    SHA1    : {}", fmt_hash(&msv.sha1_hash, c));
+            println!("    DPAPI   : {}", fmt_hash(&msv.sha1_hash, c));
+        }
+        if let Some(wd) = &cred.wdigest {
+            if !wd.password.is_empty() {
+                println!("  {}[WDigest]{}", c.cyan, c.reset);
+                println!("    Password: {}{}{}", c.red, wd.password, c.reset);
+            }
+        }
+        if let Some(krb) = &cred.kerberos {
+            println!("  {}[Kerberos]{}", c.cyan, c.reset);
+            if !krb.password.is_empty() {
+                println!("    Password: {}{}{}", c.red, krb.password, c.reset);
+            }
+            for ticket in &krb.tickets {
+                println!(
+                    "    [{}] {}",
+                    ticket.ticket_type,
+                    ticket.service_name.join("/")
+                );
+                println!("      Domain : {}", ticket.domain_name);
+                println!("      Client : {}", ticket.client_name.join("/"));
+                println!(
+                    "      EncType: {} | KeyType: {}",
+                    ticket.ticket_enc_type, ticket.key_type
+                );
+                println!("      Flags  : 0x{:08x}", ticket.ticket_flags);
+                println!("      Start  : {}", filetime_to_string(ticket.start_time));
+                println!("      End    : {}", filetime_to_string(ticket.end_time));
+                println!(
+                    "      Kirbi  : {} bytes (base64: {})",
+                    ticket.kirbi.len(),
+                    vmkatz::lsass::base64_encode(&ticket.kirbi)
+                );
+            }
+        }
+        if let Some(ts) = &cred.tspkg {
+            if !ts.password.is_empty() {
+                println!("  {}[TsPkg]{}", c.cyan, c.reset);
+                println!("    Password: {}{}{}", c.red, ts.password, c.reset);
+            }
+        }
+        for dk in &cred.dpapi {
+            println!("  {}[DPAPI]{}", c.cyan, c.reset);
+            println!("    GUID          : {}", dk.guid);
+            println!("    MasterKey     : {}{}{}", c.yellow, hex::encode(&dk.key), c.reset);
+            println!("    SHA1 MasterKey: {}{}{}", c.yellow, hex::encode(dk.sha1_masterkey), c.reset);
+        }
+        if !cred.credman.is_empty() {
+            println!("  {}[CredMan]{}", c.cyan, c.reset);
+            for cm in &cred.credman {
+                println!("    Target  : {}", cm.target);
+                println!("    Username: {}", cm.username);
+                println!("    Domain  : {}", cm.domain);
+                println!("    Password: {}{}{}", c.red, cm.password, c.reset);
+            }
+        }
+        if let Some(ssp) = &cred.ssp {
+            if !ssp.password.is_empty() {
+                println!("  {}[SSP]{}", c.cyan, c.reset);
+                println!("    Username: {}", ssp.username);
+                println!("    Domain  : {}", ssp.domain);
+                println!("    Password: {}{}{}", c.red, ssp.password, c.reset);
+            }
+        }
+        if let Some(live) = &cred.livessp {
+            if !live.password.is_empty() {
+                println!("  {}[LiveSSP]{}", c.cyan, c.reset);
+                println!("    Username: {}", live.username);
+                println!("    Domain  : {}", live.domain);
+                println!("    Password: {}{}{}", c.red, live.password, c.reset);
+            }
+        }
+        if let Some(cap) = &cred.cloudap {
+            println!("  {}[CloudAP]{}", c.cyan, c.reset);
+            println!("    Username : {}", cap.username);
+            println!("    Domain   : {}", cap.domain);
+            if !cap.dpapi_key.is_empty() {
+                println!("    DPAPI Key: {}{}{}", c.yellow, hex::encode(&cap.dpapi_key), c.reset);
+            }
+            if !cap.prt.is_empty() {
+                println!("    PRT      : {}", cap.prt);
+            }
+        }
+        println!();
     }
 }
 
@@ -1031,7 +1260,7 @@ fn print_csv(credentials: &[Credential]) {
         let (nt, lm, sha1) = if let Some(msv) = &cred.msv {
             (
                 hex::encode(msv.nt_hash),
-                hex::encode(msv.lm_hash),
+                fmt_lm_pwdump(&msv.lm_hash),
                 hex::encode(msv.sha1_hash),
             )
         } else {
