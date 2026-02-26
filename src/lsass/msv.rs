@@ -686,6 +686,7 @@ fn walk_msv_list(
     keys: &CryptoKeys,
 ) -> Vec<(u64, MsvCredential)> {
     let mut results = Vec::new();
+    let mut validated_variant: Option<usize> = None;
     let head_flink = match vmem.read_virt_u64(list_addr) {
         Ok(f) => f,
         Err(_) => return results,
@@ -742,7 +743,9 @@ fn walk_msv_list(
 
         if let Some(cred_ptr) = cred_ptr {
             if !username.is_empty() {
-                if let Ok(cred) = extract_primary_credential(vmem, cred_ptr, keys) {
+                if let Ok(cred) =
+                    extract_primary_credential(vmem, cred_ptr, keys, &mut validated_variant)
+                {
                     log::info!(
                         "MSV credential: LUID=0x{:x} user={} domain={} NT={}",
                         luid,
@@ -1057,6 +1060,7 @@ fn walk_hash_table(
     keys: &CryptoKeys,
 ) -> Vec<(u64, MsvCredential)> {
     let mut results = Vec::new();
+    let mut validated_variant: Option<usize> = None;
     let mut non_empty = 0;
 
     for bucket_idx in 0..bucket_count {
@@ -1112,7 +1116,12 @@ fn walk_hash_table(
 
             if let Some(cred_ptr) = cred_ptr {
                 if !username.is_empty() {
-                    if let Ok(cred) = extract_primary_credential(vmem, cred_ptr, keys) {
+                    if let Ok(cred) = extract_primary_credential(
+                        vmem,
+                        cred_ptr,
+                        keys,
+                        &mut validated_variant,
+                    ) {
                         log::info!(
                             "MSV credential (hash table bucket {}): LUID=0x{:x} user={} domain={} NT={}",
                             bucket_idx, luid, username, domain, hex::encode(cred.nt_hash)
@@ -1233,18 +1242,22 @@ pub struct RawPrimaryCred {
 }
 
 /// Public wrapper for extracting primary credentials from a KIWI_MSV1_0_PRIMARY_CREDENTIALS pointer.
+/// `validated_variant` tracks which PRIMARY_CRED_OFFSET_VARIANT was SHA1-validated for a prior
+/// credential in the same LSASS process. All credentials share the same Windows build → same variant.
 pub fn try_extract_primary_credential(
     vmem: &impl VirtualMemory,
     cred_ptr: u64,
     keys: &CryptoKeys,
+    validated_variant: &mut Option<usize>,
 ) -> Result<RawPrimaryCred> {
-    extract_primary_credential(vmem, cred_ptr, keys)
+    extract_primary_credential(vmem, cred_ptr, keys, validated_variant)
 }
 
 fn extract_primary_credential(
     vmem: &impl VirtualMemory,
     cred_ptr: u64,
     keys: &CryptoKeys,
+    validated_variant: &mut Option<usize>,
 ) -> Result<RawPrimaryCred> {
     // KIWI_MSV1_0_PRIMARY_CREDENTIALS (x64):
     //   +0x00: next (PTR, 8)
@@ -1303,10 +1316,46 @@ fn extract_primary_credential(
 
     // Try each offset variant and pick the one that makes sense.
     // Validation strategy (ranked by confidence):
+    //   0. Previously SHA1-validated variant → reuse (same LSASS → same Windows build)
     //   1. SHA1(NT) == SHA1 field → strongest confirmation, accept immediately
     //   2. Structural flag validation + entropy → strong (checks isNtOwf boolean flags)
     //   3. NT passes entropy → fallback, take first passing variant
     //   4. If no variant passes, return error (don't guess)
+    //
+    // Key insight: ShaOwPassword stores SHA1(UTF16LE(password)) for human accounts,
+    // NOT SHA1(NTHash). So SHA1 validation only works for machine accounts (where the
+    // "password" IS the NT hash bytes). For human accounts we rely on the validated
+    // variant from a prior machine-account credential, or structural analysis.
+
+    // Phase 0: If we already SHA1-validated a variant for a prior credential, reuse it.
+    // All credentials in the same LSASS process use the same Windows build → same offsets.
+    if let Some(vi) = *validated_variant {
+        let offsets = &PRIMARY_CRED_OFFSET_VARIANTS[vi];
+        let nt_off = offsets.nt_hash as usize;
+        let lm_off = offsets.lm_hash as usize;
+        let sha1_off = offsets.sha1_hash as usize;
+
+        if decrypted.len() >= sha1_off + 20 {
+            let mut nt_hash = [0u8; 16];
+            let mut lm_hash = [0u8; 16];
+            nt_hash.copy_from_slice(&decrypted[nt_off..nt_off + 16]);
+            lm_hash.copy_from_slice(&decrypted[lm_off..lm_off + 16]);
+
+            if nt_hash != [0u8; 16] && looks_like_hash(&nt_hash) {
+                let computed_sha1 = sha1_digest(&nt_hash);
+                log::info!(
+                    "  Using previously validated variant {} (nt=0x{:x}) for this credential",
+                    vi, offsets.nt_hash
+                );
+                return Ok(RawPrimaryCred {
+                    lm_hash,
+                    nt_hash,
+                    sha1_hash: computed_sha1,
+                });
+            }
+        }
+    }
+
     let mut best_result: Option<RawPrimaryCred> = None;
     // Entropy candidates: (variant_index, struct_score, cred)
     let mut entropy_candidates: Vec<(usize, u32, RawPrimaryCred)> = Vec::new();
@@ -1338,6 +1387,7 @@ fn extract_primary_credential(
                 "  Using primary cred offset variant {} (nt=0x{:x}, lm=0x{:x}, sha1=0x{:x}) [SHA1 validated]",
                 vi, offsets.nt_hash, offsets.lm_hash, offsets.sha1_hash
             );
+            *validated_variant = Some(vi);
             best_result = Some(RawPrimaryCred {
                 lm_hash,
                 nt_hash,
@@ -1367,6 +1417,38 @@ fn extract_primary_credential(
         }
     }
 
+    // DPAPI cross-check: when isDPAPIProtected=1, the 16 bytes at offset 0x6A are
+    // the DPAPI Protected hash, NOT the NT hash. Reject any entropy candidate whose
+    // NT hash matches that field — it's reading the wrong data.
+    if best_result.is_none() && !entropy_candidates.is_empty() && decrypted.len() >= 0x7A {
+        let flags_look_valid = decrypted.len() >= 0x2D
+            && decrypted[0x28..0x2D].iter().all(|&b| b <= 1);
+        let is_dpapi_protected = flags_look_valid && decrypted[0x2C] == 1;
+
+        if is_dpapi_protected {
+            let dpapi_field = &decrypted[0x6A..0x7A]; // 16 bytes at DPAPIProtected offset
+            let before = entropy_candidates.len();
+            entropy_candidates.retain(|(vi, _, cred)| {
+                if cred.nt_hash[..] == dpapi_field[..] {
+                    log::info!(
+                        "  Rejecting variant {} (nt=0x{:x}): NT hash matches DPAPIProtected field at 0x6A",
+                        vi,
+                        PRIMARY_CRED_OFFSET_VARIANTS[*vi].nt_hash
+                    );
+                    false
+                } else {
+                    true
+                }
+            });
+            if entropy_candidates.len() < before {
+                log::info!(
+                    "  DPAPI cross-check: rejected {} candidates (isDPAPIProtected=1)",
+                    before - entropy_candidates.len()
+                );
+            }
+        }
+    }
+
     // Use SHA1-validated result, or best entropy-based result.
     // Among entropy candidates, prefer those with higher structural scores (boolean flag validation).
     if best_result.is_none() && !entropy_candidates.is_empty() {
@@ -1377,6 +1459,10 @@ fn extract_primary_credential(
             "  Using primary cred offset variant {} [entropy-based, SHA1 computed, struct_score={}]",
             vi, score
         );
+        // Also remember this variant for future credentials (less confident than SHA1)
+        if *score >= 10 {
+            *validated_variant = Some(*vi);
+        }
         best_result = Some(entropy_candidates.swap_remove(0).2);
     }
 

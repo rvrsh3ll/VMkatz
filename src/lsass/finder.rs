@@ -826,6 +826,8 @@ fn scan_phys_for_msv_credentials<P: PhysicalMemory>(
 
     // Process each candidate, deduplicating by encrypted data content
     let mut seen_enc_data: std::collections::HashSet<Vec<u8>> = std::collections::HashSet::new();
+    // Track SHA1-validated variant across credentials (same LSASS → same Windows build)
+    let mut validated_variant: Option<usize> = None;
     for (vaddr, _paddr) in &cred_candidates {
         // Deduplicate: read first 32 bytes of encrypted data and skip if already seen
         let enc_size = vmem.read_virt_u16(*vaddr + 0x18).unwrap_or(0) as usize;
@@ -857,7 +859,12 @@ fn scan_phys_for_msv_credentials<P: PhysicalMemory>(
         }
 
         // Extract encrypted credentials
-        match crate::lsass::msv::try_extract_primary_credential(vmem, *vaddr, keys) {
+        match crate::lsass::msv::try_extract_primary_credential(
+            vmem,
+            *vaddr,
+            keys,
+            &mut validated_variant,
+        ) {
             Ok(cred) => {
                 // Check if the hash is non-zero (not empty)
                 if cred.nt_hash == [0u8; 16] {
