@@ -4,8 +4,10 @@
 //!   `Users\{user}\AppData\Roaming\Microsoft\Protect\{SID}\{GUID}`
 //!
 //! Generates Hashcat-compatible hashes:
-//!   - Mode 15300: DPAPI masterkey v1 (3DES/SHA1)
-//!   - Mode 15900: DPAPI masterkey v2 (AES256/SHA512)
+//!   - Mode 15300: DPAPI masterkey v1, local user (3DES/SHA1, SHA1 pre-key)
+//!   - Mode 15310: DPAPI masterkey v1, domain user (3DES/SHA1, NTLM pre-key)
+//!   - Mode 15900: DPAPI masterkey v2, local user (AES256/SHA512, SHA1 pre-key)
+//!   - Mode 15910: DPAPI masterkey v2, domain user (AES256/SHA512, NTLM pre-key)
 
 use std::io::{Read, Seek};
 
@@ -58,6 +60,8 @@ pub struct DpapiMasterKeyHash {
     pub hash: String,
     /// Hashcat mode (15300 or 15900).
     pub mode: u32,
+    /// NTFS modification time (Windows FILETIME, 0 if unavailable).
+    pub modified: u64,
 }
 
 /// Parse the 128-byte file header.
@@ -159,10 +163,12 @@ fn hash_name(alg: u32) -> Option<&'static str> {
 /// Parse a DPAPI master key file and generate a Hashcat hash string.
 ///
 /// Returns None if the file is not a valid DPAPI master key file.
+/// `modified` is the NTFS modification time as a Windows FILETIME (0 if unavailable).
 pub fn parse_masterkey_file(
     data: &[u8],
     username: &str,
     sid: &str,
+    modified: u64,
 ) -> Option<DpapiMasterKeyHash> {
     if data.len() < MIN_FILE_SIZE {
         return None;
@@ -209,10 +215,12 @@ pub fn parse_masterkey_file(
     // indicating a domain-joined machine where NTLM pre-key was used.
     let context = if header.domainkey_len > 0 { 2u32 } else { 1u32 };
 
-    // Hashcat mode
-    let mode = match hc_version {
-        1 => 15300,
-        2 => 15900,
+    // Hashcat mode: context 1 = local (SHA1 pre-key), context 2 = domain (NTLM pre-key)
+    let mode = match (hc_version, context) {
+        (1, 1) => 15300, // 3DES/SHA1, local
+        (1, 2) => 15310, // 3DES/SHA1, domain
+        (2, 1) => 15900, // AES256/SHA512, local
+        (2, 2) => 15910, // AES256/SHA512, domain
         _ => return None,
     };
 
@@ -234,6 +242,7 @@ pub fn parse_masterkey_file(
         guid: header.guid,
         hash: hash_str,
         mode,
+        modified,
     })
 }
 
@@ -364,7 +373,14 @@ fn scan_protect_dir<'n, R: Read + Seek>(
                 Err(_) => continue,
             };
 
-            if let Some(hash) = parse_masterkey_file(&mk_data, username, sid_name) {
+            // Read NTFS modification time as a proxy for key creation date
+            let modified = mk_file
+                .info()
+                .ok()
+                .map(|info| info.modification_time().nt_timestamp())
+                .unwrap_or(0);
+
+            if let Some(hash) = parse_masterkey_file(&mk_data, username, sid_name, modified) {
                 log::info!(
                     "DPAPI masterkey: user={} SID={} GUID={} mode={}",
                     username, sid_name, hash.guid, hash.mode
@@ -462,7 +478,7 @@ mod tests {
             *b = 0xBB;
         }
 
-        let result = parse_masterkey_file(&data, "TestUser", "S-1-5-21-111-222-333-1001");
+        let result = parse_masterkey_file(&data, "TestUser", "S-1-5-21-111-222-333-1001", 0);
         assert!(result.is_some());
         let hash = result.unwrap();
         assert_eq!(hash.mode, 15900);
@@ -502,7 +518,7 @@ mod tests {
             *b = 0xDD;
         }
 
-        let result = parse_masterkey_file(&data, "Admin", "S-1-5-21-999-888-777-500");
+        let result = parse_masterkey_file(&data, "Admin", "S-1-5-21-999-888-777-500", 0);
         assert!(result.is_some());
         let hash = result.unwrap();
         assert_eq!(hash.mode, 15300);

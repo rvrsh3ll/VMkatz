@@ -311,7 +311,7 @@ fn fmt_lm_pwdump(hash: &[u8; 16]) -> String {
 /// Format a password for display: if it contains non-printable/control characters
 /// (typical of machine account random passwords), show as hex instead of garbled Unicode.
 fn fmt_password(password: &str, c: &Colors) -> String {
-    // Raw hex from decode_password_bytes (machine account / binary password)
+    // Raw hex from decode_password_bytes (binary password that failed UTF-16 decode)
     if let Some(hex_str) = password.strip_prefix(RAW_HEX_PREFIX) {
         return format!("{}(hex) {}{}", c.dim, hex_str, c.reset);
     }
@@ -495,10 +495,18 @@ fn vmkatz_main() -> anyhow::Result<()> {
             || ext.eq_ignore_ascii_case("vhdx")
             || ext.eq_ignore_ascii_case("vhd");
         let is_block_device = is_block_dev(input_path);
+        // Block devices may be QEMU savevm states (LVM snapshots on Proxmox) —
+        // check magic before assuming SAM/disk mode.
+        let is_memory_snapshot = is_block_device && {
+            #[cfg(feature = "qemu")]
+            { vmkatz::qemu::is_qemu_savevm(input_path) }
+            #[cfg(not(feature = "qemu"))]
+            { false }
+        };
         #[cfg(feature = "ntds.dit")]
-        let sam_mode = args.sam || args.ntds || is_disk_ext || is_block_device;
+        let sam_mode = (args.sam || args.ntds || is_disk_ext || is_block_device) && !is_memory_snapshot;
         #[cfg(not(feature = "ntds.dit"))]
-        let sam_mode = args.sam || is_disk_ext || is_block_device;
+        let sam_mode = (args.sam || is_disk_ext || is_block_device) && !is_memory_snapshot;
         if sam_mode {
             return run_sam(input_path, &args);
         }
@@ -804,6 +812,7 @@ fn run_sam(input_path: &Path, args: &Args) -> anyhow::Result<()> {
 
     // Extract DPAPI master key hashes from user profiles (independent of SAM)
     let dpapi_hashes = vmkatz::sam::extract_dpapi_masterkeys(input_path);
+    let dpapi_hashes = dedup_dpapi_hashes(dpapi_hashes, args.all);
     if !dpapi_hashes.is_empty() {
         found_anything = true;
         match args.format.as_str() {
@@ -856,6 +865,7 @@ fn run_ntds(input_path: &Path, args: &Args) -> anyhow::Result<()> {
 
     // Also extract DPAPI master key hashes from user profiles on the same disk
     let dpapi_hashes = vmkatz::sam::extract_dpapi_masterkeys(input_path);
+    let dpapi_hashes = dedup_dpapi_hashes(dpapi_hashes, args.all);
     if !dpapi_hashes.is_empty() {
         match args.format.as_str() {
             "csv" => print_dpapi_masterkey_csv(&dpapi_hashes),
@@ -1152,20 +1162,44 @@ fn print_ntds_brief(entries: &[vmkatz::ntds::AdHashEntry]) {
 fn print_sam_text(entries: &[vmkatz::sam::SamEntry], c: &Colors) {
     println!("\n{}[+] SAM Hashes:{}", c.green, c.reset);
     for entry in entries {
+        // Build status annotation
+        let status = sam_status_label(entry, c);
+
         if entry.lm_hash != ZERO_HASH_16 {
             println!(
-                "  RID: {:<5} {}{:<20}{}  NT:{}  LM:{}",
+                "  RID: {:<5} {}{:<20}{}  NT:{}  LM:{}{}",
                 entry.rid, c.bold, entry.username, c.reset,
                 fmt_hash(&entry.nt_hash, c),
                 fmt_hash(&entry.lm_hash, c),
+                status,
             );
         } else {
             println!(
-                "  RID: {:<5} {}{:<20}{}  NT:{}",
+                "  RID: {:<5} {}{:<20}{}  NT:{}{}",
                 entry.rid, c.bold, entry.username, c.reset,
                 fmt_hash(&entry.nt_hash, c),
+                status,
             );
         }
+    }
+}
+
+/// Build a human-readable status label for a SAM entry.
+#[cfg(feature = "sam")]
+fn sam_status_label(entry: &vmkatz::sam::SamEntry, c: &Colors) -> String {
+    let mut tags = Vec::new();
+    if entry.is_disabled() {
+        tags.push("DISABLED");
+    }
+    if entry.nt_hash == ZERO_HASH_16 {
+        tags.push("NO PASSWORD");
+    } else if hex::encode(entry.nt_hash) == BLANK_NT_HEX {
+        tags.push("BLANK PASSWORD");
+    }
+    if tags.is_empty() {
+        String::new()
+    } else {
+        format!("  {}({}){}", c.dim, tags.join(", "), c.reset)
     }
 }
 
@@ -1263,6 +1297,27 @@ fn print_lsa_csv(secrets: &[vmkatz::sam::lsa::LsaSecret]) {
     }
 }
 
+/// Keep only the most recent DPAPI master key per (username, sid) unless `show_all` is set.
+#[cfg(feature = "sam")]
+fn dedup_dpapi_hashes(
+    mut hashes: Vec<vmkatz::sam::dpapi_masterkey::DpapiMasterKeyHash>,
+    show_all: bool,
+) -> Vec<vmkatz::sam::dpapi_masterkey::DpapiMasterKeyHash> {
+    if show_all || hashes.len() <= 1 {
+        return hashes;
+    }
+    // Sort by (username, sid, modified DESC) so the most recent key comes first
+    hashes.sort_by(|a, b| {
+        a.username
+            .cmp(&b.username)
+            .then(a.sid.cmp(&b.sid))
+            .then(b.modified.cmp(&a.modified))
+    });
+    let mut seen = std::collections::HashSet::new();
+    hashes.retain(|h| seen.insert((h.username.clone(), h.sid.clone())));
+    hashes
+}
+
 #[cfg(feature = "sam")]
 fn print_dpapi_masterkey_csv(hashes: &[vmkatz::sam::dpapi_masterkey::DpapiMasterKeyHash]) {
     println!("provider,username,domain,secret_type,secret,target");
@@ -1292,8 +1347,19 @@ fn print_dcc2_hashcat(creds: &[vmkatz::sam::cache::CachedCredential]) {
 
 #[cfg(feature = "sam")]
 fn print_lsa_secrets(secrets: &[vmkatz::sam::lsa::LsaSecret], c: &Colors) {
+    use vmkatz::sam::lsa::LsaSecretType;
+    // Only show secrets with actionable parsed data.
+    // Skip empty service passwords and unparsed raw blobs (L$TermServ*, SAC, SCM, etc.)
+    let visible: Vec<_> = secrets.iter().filter(|s| {
+        !matches!(&s.parsed,
+            LsaSecretType::ServicePassword { password, .. } if password.is_empty()
+        ) && !matches!(&s.parsed, LsaSecretType::Raw)
+    }).collect();
+    if visible.is_empty() {
+        return;
+    }
     println!("\n{}[+] LSA Secrets:{}", c.green, c.reset);
-    for secret in secrets {
+    for secret in visible {
         println!("{}", secret);
     }
 }
@@ -1334,6 +1400,8 @@ fn print_dpapi_masterkey_text(
     hashes: &[vmkatz::sam::dpapi_masterkey::DpapiMasterKeyHash],
     c: &Colors,
 ) {
+    use vmkatz::lsass::types::filetime_to_string;
+
     println!(
         "\n{}[+] DPAPI Master Key Files ({} found):{}",
         c.green,
@@ -1343,7 +1411,17 @@ fn print_dpapi_masterkey_text(
     for h in hashes {
         println!("  User: {} ({})", h.username, h.sid);
         println!("    GUID    : {}", h.guid);
-        println!("    Hashcat : mode {} ({})", h.mode, if h.mode == 15300 { "3DES/SHA1" } else { "AES256/SHA512" });
+        if h.modified != 0 {
+            println!("    Modified: {}", filetime_to_string(h.modified));
+        }
+        let mode_desc = match h.mode {
+            15300 => "3DES/SHA1, local",
+            15310 => "3DES/SHA1, domain",
+            15900 => "AES256/SHA512, local",
+            15910 => "AES256/SHA512, domain",
+            _ => "unknown",
+        };
+        println!("    Hashcat : mode {} ({})", h.mode, mode_desc);
         println!("    Hash    : {}", h.hash);
     }
 }
@@ -1627,6 +1705,36 @@ fn run_lsass(
                 anyhow::bail!("QEMU ELF support not enabled (compile with --features qemu)")
             }
         }
+        LsassFormat::QemuSavevm => {
+            #[cfg(feature = "qemu")]
+            {
+                run_with_layer(
+                    || {
+                        if verbose {
+                            eprintln!("[*] Opening QEMU savevm state: {}", input_path.display());
+                        }
+                        let layer = vmkatz::qemu::QemuSavevmLayer::open(input_path)
+                            .context("Failed to open QEMU savevm state")?;
+                        if verbose {
+                            eprintln!(
+                                "[+] QEMU savevm: {} MB physical memory",
+                                layer.phys_size() / (1024 * 1024),
+                            );
+                        }
+                        Ok(layer)
+                    },
+                    args,
+                    verbose,
+                    pagefile,
+                    disk_path,
+                )
+            }
+            #[cfg(not(feature = "qemu"))]
+            {
+                let _ = (pagefile, disk_path);
+                anyhow::bail!("QEMU savevm support not enabled (compile with --features qemu)")
+            }
+        }
         LsassFormat::HypervBin => {
             #[cfg(feature = "hyperv")]
             {
@@ -1763,9 +1871,11 @@ fn is_block_dev(path: &Path) -> bool {
     feature = "qemu",
     feature = "hyperv"
 ))]
+#[allow(dead_code)] // QemuSavevm only constructed when feature "qemu" is enabled
 enum LsassFormat {
     VBox,
     QemuElf,
+    QemuSavevm,
     HypervBin,
     HypervVmrs,
     Vmware,
@@ -1791,7 +1901,11 @@ fn detect_lsass_format(path: &Path, ext: &str, carve: bool) -> LsassFormat {
         return LsassFormat::HypervVmrs;
     }
     if ext.eq_ignore_ascii_case("bin") {
-        // Could be Hyper-V .bin or a raw dump — check for ELF/VMRS magic
+        // Could be Hyper-V .bin, QEMU savevm, or a raw dump — check magic
+        #[cfg(feature = "qemu")]
+        if vmkatz::qemu::is_qemu_savevm(path) {
+            return LsassFormat::QemuSavevm;
+        }
         if has_elf_magic(path) {
             return LsassFormat::QemuElf;
         }
@@ -1802,7 +1916,11 @@ fn detect_lsass_format(path: &Path, ext: &str, carve: bool) -> LsassFormat {
         return LsassFormat::HypervBin;
     }
     if ext.eq_ignore_ascii_case("raw") {
-        // Raw memory dump — check for ELF magic (virsh dump can produce .raw)
+        // Raw memory dump — check for QEVM/ELF magic
+        #[cfg(feature = "qemu")]
+        if vmkatz::qemu::is_qemu_savevm(path) {
+            return LsassFormat::QemuSavevm;
+        }
         if has_elf_magic(path) {
             return LsassFormat::QemuElf;
         }
@@ -1810,6 +1928,10 @@ fn detect_lsass_format(path: &Path, ext: &str, carve: bool) -> LsassFormat {
     }
 
     // For unknown extensions, try magic-based detection
+    #[cfg(feature = "qemu")]
+    if vmkatz::qemu::is_qemu_savevm(path) {
+        return LsassFormat::QemuSavevm;
+    }
     if has_elf_magic(path) {
         return LsassFormat::QemuElf;
     }
@@ -2633,7 +2755,7 @@ fn print_text(credentials: &[Credential], c: &Colors, show_all: bool, verbose: b
             }
         }
         if let Some(wd) = &cred.wdigest {
-            if !wd.password.is_empty() && should_show(providers, "wdigest") {
+            if !wd.password.is_empty() && !cred.username.ends_with('$') && should_show(providers, "wdigest") {
                 println!("  {}[WDigest]{}", c.cyan, c.reset);
                 println!("    Password: {}", fmt_password(&wd.password, c));
             }
@@ -2641,7 +2763,8 @@ fn print_text(credentials: &[Credential], c: &Colors, show_all: bool, verbose: b
         if let Some(krb) = &cred.kerberos {
             if should_show(providers, "kerberos") {
                 println!("  {}[Kerberos]{}", c.cyan, c.reset);
-                if !krb.password.is_empty() {
+                // Skip machine account passwords (binary blobs, use keys instead)
+                if !krb.password.is_empty() && !cred.username.ends_with('$') {
                     println!("    Password: {}", fmt_password(&krb.password, c));
                 }
                 // Deduplicate keys by value — show each unique key once with primary etype
@@ -2919,12 +3042,11 @@ fn report_extraction_summary(credentials: &[Credential], format: &str) {
     let with_pw = credentials
         .iter()
         .filter(|c| {
-            c.wdigest
-                .as_ref()
-                .is_some_and(|w| !w.password.is_empty())
-                || c.kerberos
-                    .as_ref()
-                    .is_some_and(|k| !k.password.is_empty())
+            // Don't count machine account passwords (binary blobs, not useful)
+            let is_machine = c.username.ends_with('$');
+            (!is_machine
+                && (c.wdigest.as_ref().is_some_and(|w| !w.password.is_empty())
+                    || c.kerberos.as_ref().is_some_and(|k| !k.password.is_empty())))
                 || c.tspkg.as_ref().is_some_and(|t| !t.password.is_empty())
         })
         .count();
